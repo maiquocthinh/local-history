@@ -1,0 +1,20 @@
+[package]
+name = "daemon"
+version.workspace = true
+edition.workspace = true
+description = "local-history watcher daemon"
+
+[[bin]]
+name = "lh-daemon"
+path = "src/main.rs"
+
+[dependencies]
+history = { path = "../history" }
+notify = { workspace = true }
+fd-lock = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

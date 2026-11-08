@@ -1,0 +1,73 @@
+# English strings for the `lh` CLI.
+# Format: one YAML tree per file; the locale is the file stem (en.yml → "en").
+# Nested maps flatten into dotted keys (err.io, history.col.seq, ...).
+# Rule: the key set here must exactly match vi.yml — enforced by the test
+# `i18n_yml_key_parity_and_cover_t_calls` in crates/cli/src/lib.rs.
+# `%{name}` = placeholder. Values are single-line double-quoted strings.
+err:
+  io: "io: %{e}"
+  store_empty: "store has no data at %{path} — no version has ever been written"
+  binary_content: "binary file, cannot diff (version %{id}) — use `lh show` to get the raw content"
+  read_current: "failed to read the current content of %{file}: %{err}"
+  empty_label: "label is empty"
+  current_exe: "failed to get current_exe: %{err}"
+  exe_dir: "failed to get the directory containing the lh executable"
+  gui_missing: "%{path} not found — build it first: cargo build -p gui"
+  spawn: "failed to spawn %{path}: %{err}"
+  outside_workspace: "no registered workspace contains %{file} — the file must be inside a registered workspace"
+  cwd: "failed to get the current directory: %{err}"
+  invalid_path: "invalid path: %{path}"
+  canonicalize: "%{path}: %{err}"
+  bad_seq: "`%{s}` is not a valid seq (expected an integer ≥ 0)"
+  negative_seq: "seq must be ≥ 0, got: %{n}"
+  seq_not_found: "seq %{seq} not found (file has %{count} versions, seq %{min}..%{max})"
+  no_versions: "file has no versions yet"
+  bad_lang: "invalid --lang value: `%{v}` (expected en or vi)"
+status:
+  store_root: "store root : %{root}"
+  daemon_running: "running"
+  daemon_no_reply: "not responding"
+  daemon_line: "daemon     : %{state} (pid %{pid}, start %{time})"
+  daemon_watch: "             watch: %{ws}"
+  daemon_stopped: "daemon     : not running"
+  workspaces_none: "workspaces : (none)"
+  workspaces_label: "workspaces :"
+  last_gc: "last GC    : n/a (gc runs are not recorded)"
+  tip: "tip        : lh-daemon --dir <project> starts watching · lh history <file> shows the timeline · lh ui opens the GUI"
+ws:
+  col:
+    id: "id"
+    root: "root"
+    files: "files"
+    versions: "versions"
+  none: "(no workspaces in %{root} — the daemon will register one on first run)"
+  header: "workspaces in %{root}:"
+history:
+  empty: "no versions yet for %{file} (ws: %{ws})"
+  header: "history of %{file} (ws: %{ws})"
+  col:
+    seq: "seq"
+    time: "time (UTC)"
+    kind: "kind"
+    storage: "storage"
+    size: "size"
+    label: "label"
+show:
+  wrote: "wrote content of seq %{seq} (%{bytes} bytes) → %{path}"
+revert:
+  plan: "will revert %{file} to seq %{seq} — kind=%{kind}, %{time}, %{size}"
+  confirm: "Revert to seq %{seq}? [y/N] "
+  cancelled: "cancelled."
+  done_pre: "✓ reverted (pre_revert: seq %{seq})"
+  done_noop: "✓ reverted (disk content already matches seq %{seq} — no pre_revert needed)"
+label:
+  done: "✓ label `%{text}` → version %{id} (seq %{seq})"
+gc:
+  header: "gc:"
+  header_dry: "gc (dry-run — nothing was deleted):"
+  files_scanned: "  files scanned    : %{n}"
+  versions_deleted: "  versions deleted : %{n}"
+  bytes_freed: "  bytes freed      : %{human} (%{bytes})"
+  orphan_blobs: "  orphan blobs     : %{n}"
+ui:
+  opened: "✓ opened lh-gui (pid %{pid})"

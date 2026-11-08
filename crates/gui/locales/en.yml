@@ -1,0 +1,104 @@
+# English strings for the `lh-gui` GUI.
+# Format: one YAML tree per file; the locale is the file stem (en.yml → "en").
+# Nested maps flatten into dotted keys (panel.workspace, diff.mode_prev, ...).
+# Rule: the key set here must exactly match vi.yml — enforced by the test
+# `i18n_yml_key_parity_and_cover_t_calls` in crates/gui/src/main.rs.
+# `%{name}` = placeholder. Values are single-line double-quoted strings.
+# Kind badges (external/save/...) are technical values and stay untranslated.
+panel:
+  workspace: "Workspace"
+  search_hint: "Search files…"
+  files_summary: "%{count} versions · %{ago}"
+  files_summary_one: "%{count} version · %{ago}"
+  files_empty: "Workspace has no files yet."
+  files_no_match: "No file matches."
+  ws_none_selected: "— none selected —"
+  ws_empty_hint: "No workspace yet — press + to add one."
+  ws_add_tip: "Add workspace"
+  timeline_no_file: "No file selected — pick one in the left panel."
+timeline:
+  empty: "This file has no versions yet."
+  no_match: "No version matches the filters."
+filter:
+  kind: "Kind:"
+  all: "All"
+  label: "Label:"
+  label_hint: "contains…"
+btn:
+  revert: "Revert to this version"
+  label: "Set label"
+  do_revert: "Revert"
+  ok: "OK"
+  cancel: "Cancel"
+  pick_store: "Choose store folder…"
+confirm:
+  revert_text: "Overwrite the current file '%{rel}' with content of seq %{seq}?"
+  revert_note: "The current version will be snapshot as pre_revert."
+  label_title: "Set label for the selected version"
+  label_hint: "e.g. before running tests"
+diff:
+  compare: "Compare:"
+  mode_prev: "with previous version"
+  mode_disk: "with current disk content"
+  mode_any: "any two versions"
+  pick: "— pick —"
+  disk_title: "Current disk content"
+  binary: "(binary file — cannot be diffed)"
+  identical: "Both sides are identical."
+  no_store: "Store not opened yet."
+  no_ws: "No workspace selected."
+  no_file: "No file selected."
+  no_version: "No version selected."
+  no_versions: "File has no versions yet."
+  version_gone: "Version is no longer in the timeline (maybe GC'd)."
+  version_right_gone: "The right-side version is no longer in the timeline."
+  file_missing: "File is no longer on disk (deleted?)."
+store:
+  missing_title: "No local-history store"
+  missing_text: "Cannot open index.db at:\n%{path}"
+  missing_hint: "Run `lh-daemon` first to create a store, or pick an existing store folder."
+dlg:
+  pick_store: "Pick store folder (with index.db)"
+  pick_ws: "Pick a workspace folder to track"
+lang:
+  label: "Language"
+  auto: "Auto"
+  en: "English"
+  vi: "Tiếng Việt"
+status:
+  ready: "Ready."
+  store: "Store: %{root}"
+  ws: "WS: %{root}"
+  poll: "Poll: %{time}"
+  ws_added: "workspace added: %{path}"
+  state_save: "cannot write gui-state.json: %{e}"
+msg:
+  file_outside_ws: "'%{file}' does not belong to any registered workspace."
+  file_no_versions_yet: "'%{file}' has no versions yet (waiting for the daemon)."
+  reverted_pre: "reverted '%{file}' to seq %{seq} (pre_revert: seq %{pre})"
+  reverted_noop: "reverted to seq %{seq} (disk already matches this content)"
+  label_set: "label set: %{text}"
+  label_cleared: "label cleared"
+err:
+  workspaces: "failed to read workspaces: %{e}"
+  list_files: "failed to read the file list: %{e}"
+  history: "failed to read history: %{e}"
+  ws_add: "cannot add workspace: %{e}"
+  revert: "revert failed: %{e}"
+  label: "cannot set label: %{e}"
+  no_index: "folder has no index.db — run lh-daemon first."
+  content: "failed to read version content: %{e}"
+  diff: "diff failed: %{e}"
+day:
+  today: "Today"
+  yesterday: "Yesterday"
+time:
+  now: "just now"
+  minutes_ago: "%{n} minutes ago"
+  minutes_ago_one: "%{n} minute ago"
+  hours_ago: "%{n} hours ago"
+  hours_ago_one: "%{n} hour ago"
+  days_ago: "%{n} days ago"
+  days_ago_one: "%{n} day ago"
+tip:
+  version: "seq %{seq} · %{kind} · hash %{hash}…"

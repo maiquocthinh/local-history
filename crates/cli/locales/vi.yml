@@ -1,0 +1,73 @@
+# Chuỗi tiếng Việt cho CLI `lh`.
+# Format: mỗi file chứa đúng 1 cây YAML; locale là tên file (vi.yml → "vi").
+# Map lồng được flatten thành key có dấu chấm (err.io, history.col.seq, ...).
+# Quy tắc: tập key ở đây phải trùng khớp en.yml — kiểm bởi test
+# `i18n_yml_key_parity_and_cover_t_calls` trong crates/cli/src/lib.rs.
+# `%{name}` = placeholder. Value là chuỗi double-quoted nằm trọn 1 dòng.
+err:
+  io: "io: %{e}"
+  store_empty: "store chưa có dữ liệu tại %{path} — chưa từng ghi version nào"
+  binary_content: "binary file, không diff được (version %{id}) — dùng `lh show` để lấy nội dung thô"
+  read_current: "đọc nội dung hiện tại của %{file} lỗi: %{err}"
+  empty_label: "label rỗng"
+  current_exe: "không lấy được current_exe: %{err}"
+  exe_dir: "không lấy được thư mục chứa lh"
+  gui_missing: "chưa có %{path} — build trước: cargo build -p gui"
+  spawn: "spawn %{path} lỗi: %{err}"
+  outside_workspace: "không tìm thấy workspace chứa %{file} — file phải nằm trong một workspace đã đăng ký"
+  cwd: "không lấy được thư mục hiện tại: %{err}"
+  invalid_path: "đường dẫn không hợp lệ: %{path}"
+  canonicalize: "%{path}: %{err}"
+  bad_seq: "`%{s}` không phải số seq hợp lệ (cần số nguyên ≥ 0)"
+  negative_seq: "seq phải ≥ 0, nhận được: %{n}"
+  seq_not_found: "không tìm thấy seq %{seq} (file có %{count} version, seq %{min}..%{max})"
+  no_versions: "file chưa có version nào"
+  bad_lang: "giá trị --lang không hợp lệ: `%{v}` (chỉ nhận en hoặc vi)"
+status:
+  store_root: "store root : %{root}"
+  daemon_running: "đang chạy"
+  daemon_no_reply: "không phản hồi"
+  daemon_line: "daemon     : %{state} (pid %{pid}, start %{time})"
+  daemon_watch: "             watch: %{ws}"
+  daemon_stopped: "daemon     : không chạy"
+  workspaces_none: "workspaces : (không có)"
+  workspaces_label: "workspaces :"
+  last_gc: "lần GC cuối: n/a (không lưu lại lần gc)"
+  tip: "mẹo        : lh-daemon --dir <dự_án> bật theo dõi · lh history <file> xem timeline · lh ui mở GUI"
+ws:
+  col:
+    id: "id"
+    root: "root"
+    files: "files"
+    versions: "versions"
+  none: "(không có workspace nào trong %{root} — daemon lần đầu chạy sẽ đăng ký)"
+  header: "workspace trong %{root}:"
+history:
+  empty: "chưa có version nào cho %{file} (ws: %{ws})"
+  header: "lịch sử của %{file} (ws: %{ws})"
+  col:
+    seq: "seq"
+    time: "thời gian (UTC)"
+    kind: "kind"
+    storage: "storage"
+    size: "size"
+    label: "label"
+show:
+  wrote: "đã ghi nội dung seq %{seq} (%{bytes} bytes) → %{path}"
+revert:
+  plan: "sẽ revert %{file} về seq %{seq} — kind=%{kind}, %{time}, %{size}"
+  confirm: "Revert về seq %{seq}? [y/N] "
+  cancelled: "đã hủy."
+  done_pre: "✓ đã revert (pre_revert: seq %{seq})"
+  done_noop: "✓ đã revert (nội dung disk đã khớp seq %{seq} — không cần pre_revert)"
+label:
+  done: "✓ label `%{text}` → version %{id} (seq %{seq})"
+gc:
+  header: "gc:"
+  header_dry: "gc (dry-run — không xóa gì):"
+  files_scanned: "  files scanned    : %{n}"
+  versions_deleted: "  versions deleted : %{n}"
+  bytes_freed: "  bytes freed      : %{human} (%{bytes})"
+  orphan_blobs: "  orphan blobs     : %{n}"
+ui:
+  opened: "✓ đã mở lh-gui (pid %{pid})"

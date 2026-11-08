@@ -1,0 +1,104 @@
+# Chuỗi tiếng Việt cho GUI `lh-gui`.
+# Format: mỗi file chứa đúng 1 cây YAML; locale là tên file (vi.yml → "vi").
+# Map lồng được flatten thành key có dấu chấm (panel.workspace, diff.mode_prev, ...).
+# Quy tắc: tập key ở đây phải trùng khớp en.yml — kiểm bởi test
+# `i18n_yml_key_parity_and_cover_t_calls` trong crates/gui/src/main.rs.
+# `%{name}` = placeholder. Value là chuỗi double-quoted nằm trọn 1 dòng.
+# Badge kind (external/save/...) là giá trị kỹ thuật — giữ nguyên, không dịch.
+panel:
+  workspace: "Workspace"
+  search_hint: "Tìm file…"
+  files_summary: "%{count} phiên bản · %{ago}"
+  files_summary_one: "%{count} phiên bản · %{ago}"
+  files_empty: "Workspace chưa có file nào."
+  files_no_match: "Không khớp file nào."
+  ws_none_selected: "— chưa chọn —"
+  ws_empty_hint: "Chưa có workspace nào — bấm + để thêm."
+  ws_add_tip: "Thêm workspace"
+  timeline_no_file: "Chưa chọn file — chọn một file ở panel trái."
+timeline:
+  empty: "File chưa có version nào."
+  no_match: "Không có version nào khớp filter."
+filter:
+  kind: "Loại:"
+  all: "Tất cả"
+  label: "Nhãn:"
+  label_hint: "chứa…"
+btn:
+  revert: "Revert về version này"
+  label: "Gắn nhãn"
+  do_revert: "Revert"
+  ok: "OK"
+  cancel: "Huỷ"
+  pick_store: "Chọn thư mục store…"
+confirm:
+  revert_text: "Ghi đè file '%{rel}' hiện tại bằng nội dung seq %{seq}?"
+  revert_note: "Version hiện tại sẽ được snapshot pre_revert."
+  label_title: "Gắn nhãn cho version đang chọn"
+  label_hint: "vd: trước khi chạy test"
+diff:
+  compare: "So sánh:"
+  mode_prev: "với version trước"
+  mode_disk: "với nội dung disk hiện tại"
+  mode_any: "hai version bất kỳ"
+  pick: "— chọn —"
+  disk_title: "Hiện tại trên disk"
+  binary: "(binary file — không diff được)"
+  identical: "Hai bên giống hệt nhau."
+  no_store: "Chưa mở store."
+  no_ws: "Chưa chọn workspace."
+  no_file: "Chưa chọn file."
+  no_version: "Chưa chọn version."
+  no_versions: "File chưa có version nào."
+  version_gone: "Version không còn trong timeline (có thể bị GC)."
+  version_right_gone: "Version bên phải không còn trong timeline."
+  file_missing: "File không còn trên disk (đã bị xóa?)."
+store:
+  missing_title: "Chưa có store local-history"
+  missing_text: "Không mở được index.db tại:\n%{path}"
+  missing_hint: "Chạy `lh-daemon` trước để tạo store, hoặc chọn thư mục store đã có."
+dlg:
+  pick_store: "Chọn thư mục store (có index.db)"
+  pick_ws: "Chọn thư mục workspace để theo dõi"
+lang:
+  label: "Ngôn ngữ"
+  auto: "Tự động"
+  en: "English"
+  vi: "Tiếng Việt"
+status:
+  ready: "Sẵn sàng."
+  store: "Store: %{root}"
+  ws: "WS: %{root}"
+  poll: "Poll: %{time}"
+  ws_added: "đã thêm workspace: %{path}"
+  state_save: "Không ghi được gui-state.json: %{e}"
+msg:
+  file_outside_ws: "'%{file}' không thuộc workspace nào đã đăng ký."
+  file_no_versions_yet: "'%{file}' chưa có version nào (đợi daemon ghi)."
+  reverted_pre: "đã revert '%{file}' về seq %{seq} (pre_revert: seq %{pre})"
+  reverted_noop: "đã revert về seq %{seq} (disk đã giống nội dung này)"
+  label_set: "đã gắn nhãn: %{text}"
+  label_cleared: "đã xóa nhãn"
+err:
+  workspaces: "Lỗi đọc workspaces: %{e}"
+  list_files: "Lỗi đọc danh sách file: %{e}"
+  history: "Lỗi đọc history: %{e}"
+  ws_add: "Không thêm được workspace: %{e}"
+  revert: "Revert thất bại: %{e}"
+  label: "Lỗi gắn nhãn: %{e}"
+  no_index: "Thư mục không có index.db — hãy chạy lh-daemon trước."
+  content: "Lỗi đọc nội dung version: %{e}"
+  diff: "Lỗi diff: %{e}"
+day:
+  today: "Hôm nay"
+  yesterday: "Hôm qua"
+time:
+  now: "vừa xong"
+  minutes_ago: "%{n} phút trước"
+  minutes_ago_one: "%{n} phút trước"
+  hours_ago: "%{n} giờ trước"
+  hours_ago_one: "%{n} giờ trước"
+  days_ago: "%{n} ngày trước"
+  days_ago_one: "%{n} ngày trước"
+tip:
+  version: "seq %{seq} · %{kind} · hash %{hash}…"

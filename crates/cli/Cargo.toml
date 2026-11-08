@@ -1,0 +1,21 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+description = "local-history CLI"
+
+[[bin]]
+name = "lh"
+path = "src/main.rs"
+
+[dependencies]
+history = { path = "../history" }
+daemon = { path = "../daemon" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+rust-i18n = { workspace = true }
+sys-locale = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
