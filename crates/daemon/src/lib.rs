@@ -1,11 +1,11 @@
-//! Daemon `lh-daemon` — theo dõi các thư mục workspace qua fs events (notify), snapshot tự động
-//! mọi thay đổi file vào engine `history`.
+//! Daemon `lh-daemon` — watches workspace directories via fs events (notify) and snapshots
+//! every file change into the `history` engine.
 //!
 //! Pipeline (docs/architecture.md §4.2):
-//!   fs event → filter ignore (theo component) → debounce map (path → instant)
-//!   → path yên tĩnh ≥ DEBOUNCE_MS → đọc file → `record(..., External)` (dedup trong engine)
+//!   fs event → ignore filter (per component) → debounce map (path → instant)
+//!   → path quiet ≥ DEBOUNCE_MS → read file → `record(..., External)` (dedup in engine)
 //!
-//! Toàn bộ logic nằm ở lib (không chỉ main.rs) để test in-process qua `run_with_root`.
+//! All logic lives in the lib (not main.rs) so tests can run in-process via `run_with_root`.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -20,32 +20,48 @@ use serde::{Deserialize, Serialize};
 
 use history::{EventKind, LocalHistory, RetentionPolicy, WorkspaceId};
 
-/// Thư mục bỏ qua — match theo path component (không phân biệt hoa thường).
+// Load translations from crates/daemon/locales (baked in at compile time); a missing locale
+// falls back to en. Used by the tray module (`--tray`, see tray.rs) for menu labels — the
+// rest of the daemon output stays hardcoded Vietnamese for now.
+rust_i18n::i18n!("locales", fallback = "en");
+
+pub mod tray;
+
+/// Auto-generated 32×32 RGBA bytes of the app icon (tools/gen_icon.py) — wired into the
+/// tray icon by `tray::icon_rgba`.
+mod tray_icon_data;
+
+/// Directories skipped by the ignore filter — matched per path component, case-insensitive.
 pub const IGNORE_DIRS: &[&str] =
     &[".git", ".hg", ".svn", "target", "node_modules", "dist", "build", ".zcode"];
 
-/// Khoảng yên tĩnh tối thiểu trước khi xử lý một path (debounce).
+/// Minimum quiet period a path must reach before it is processed (debounce).
 pub const DEBOUNCE_MS: u64 = 400;
 
-/// Chu kỳ collector dậy: nhận event mới / phát các path đã yên tĩnh đủ lâu.
+/// Collector wake-up interval: absorb new events / flush paths quiet long enough.
 pub const COLLECTOR_INTERVAL_MS: u64 = 100;
 
-/// Chu kỳ GC định kỳ.
+/// Interval between periodic GC runs.
 const GC_INTERVAL_SECS: u64 = 6 * 3600;
 
+/// Crate-wide result type: every fallible operation returns this.
 pub type Result<T> = std::result::Result<T, DaemonError>;
 
-/// Lỗi daemon — enum thủ công (crate này không có thiserror).
+/// Daemon error — a manual enum (this crate has no thiserror).
 #[derive(Debug)]
 pub enum DaemonError {
-    /// Lỗi watcher (notify).
+    /// Watcher setup or event-stream failure (notify).
     Watcher(String),
-    /// Không chiếm được daemon.lock — daemon khác đang chạy trên store này.
+    /// `daemon.lock` could not be acquired — another daemon is running on this store.
     Lock,
+    /// Underlying I/O failure.
     Io(std::io::Error),
+    /// Propagated engine (`history`) error.
     History(history::Error),
-    /// Tham số / thư mục không hợp lệ.
+    /// Invalid argument or directory.
     Path(String),
+    /// Tray mode (`--tray`): event loop / icon / menu failure.
+    Tray(String),
 }
 
 impl fmt::Display for DaemonError {
@@ -58,6 +74,7 @@ impl fmt::Display for DaemonError {
             DaemonError::Io(e) => write!(f, "io: {e}"),
             DaemonError::History(e) => write!(f, "history: {e}"),
             DaemonError::Path(s) => write!(f, "path: {s}"),
+            DaemonError::Tray(s) => write!(f, "tray: {s}"),
         }
     }
 }
@@ -84,25 +101,42 @@ impl From<history::Error> for DaemonError {
     }
 }
 
-/// Trạng thái daemon — ghi `<store_root>/daemon.json`, cho CLI/GUI đọc (`lh status`).
+/// Daemon state written to `<store_root>/daemon.json` for the CLI/GUI to read (`lh status`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
+    /// Process id of the running daemon — lets consumers detect a stale status file.
     pub pid: u32,
+    /// Normalized watch directories (canonicalized, `\\?\` prefix stripped).
     pub workspaces: Vec<String>,
+    /// UTC start time as unix microseconds.
     pub started_at_micros: i64,
 }
 
-/// Chạy daemon tới khi `stop` được set true. Blocking trên thread gọi.
+/// Runs the daemon until `stop` is set to true. Blocks the calling thread.
 ///
-/// `store_root` = thư mục data (test truyền tempdir; production là root mặc định của engine,
-/// xem `run`). `watch_dirs` = các thư mục workspace cần theo dõi (rỗng → lỗi).
+/// `store_root` is the data directory (tests pass a tempdir; production uses the engine's
+/// default root, see `run`). `watch_dirs` are the workspace directories to watch (empty → error).
 pub fn run_with_root(store_root: &Path, watch_dirs: &[PathBuf], stop: Arc<AtomicBool>) -> Result<()> {
+    // No tray here: a fresh pause flag — the pipeline records everything as before.
+    run_with_root_paused(store_root, watch_dirs, stop, Arc::new(AtomicBool::new(false)))
+}
+
+/// Same as `run_with_root` plus a `pause` flag for tray mode (`--tray`): true → every fs event
+/// is dropped (nothing recorded) while the watcher keeps running and `stop` still works.
+/// Without tray, call `run_with_root` — behavior there is unchanged.
+pub fn run_with_root_paused(
+    store_root: &Path,
+    watch_dirs: &[PathBuf],
+    stop: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
+) -> Result<()> {
     if watch_dirs.is_empty() {
         return Err(DaemonError::Path("không có thư mục nào để theo dõi".into()));
     }
 
-    // 1. Chuẩn hóa watch dirs (canonicalize + strip `\\?\` — cùng quy ước với engine) rồi mở
-    //    store + đăng ký workspace. Map (canonical root → ws_id) để gán event về workspace.
+    // 1. Normalize watch dirs (canonicalize + strip `\\?\` — same convention as the engine),
+    //    then open the store + register workspaces. Pairs (canonical root → ws_id) attribute
+    //    each event back to its workspace.
     let mut dirs = Vec::with_capacity(watch_dirs.len());
     for d in watch_dirs {
         dirs.push(normalize_path(d).map_err(DaemonError::Path)?);
@@ -114,8 +148,9 @@ pub fn run_with_root(store_root: &Path, watch_dirs: &[PathBuf], stop: Arc<Atomic
         ws_entries.push((dir.clone(), ws));
     }
 
-    // 2. Lock đơn nhất. Guard giữ đến hết hàm; process chết → OS tự nhả.
-    //    (File lock rỗng, không ghi nội dung → truncate(false) rõ ý.)
+    // 2. Single-instance lock. The guard lives to the end of the function; if the process
+    //    dies, the OS releases the lock. (The file stays empty, nothing is written into it
+    //    → `truncate(false)` states that intent.)
     let lock_file = File::options()
         .create(true)
         .write(true)
@@ -124,7 +159,8 @@ pub fn run_with_root(store_root: &Path, watch_dirs: &[PathBuf], stop: Arc<Atomic
     let mut lock = fd_lock::RwLock::new(lock_file);
     let _lock_guard = lock.try_write().map_err(|_| DaemonError::Lock)?;
 
-    // 3. Status file. Gì SAU khi giữ lock → CLI đọc thấy daemon.json ⇒ daemon thật sự đang chạy.
+    // 3. Status file. Written only AFTER the lock is held → a CLI that sees daemon.json knows
+    //    a daemon is actually running.
     let status = DaemonStatus {
         pid: std::process::id(),
         workspaces: dirs.iter().map(|d| d.to_string_lossy().into_owned()).collect(),
@@ -133,7 +169,7 @@ pub fn run_with_root(store_root: &Path, watch_dirs: &[PathBuf], stop: Arc<Atomic
     write_status(store_root, &status)?;
     log::info!("daemon start: pid={} store={} ws={:?}", status.pid, store_root.display(), dirs);
 
-    // 4. Watcher — lỗi thì dọn status trước khi trả (không để daemon.json stale).
+    // 4. Watcher — on failure, clean up the status file before returning (no stale daemon.json).
     let (tx, rx) = mpsc::channel();
     let mut watcher = match notify::recommended_watcher(tx) {
         Ok(w) => w,
@@ -148,7 +184,7 @@ pub fn run_with_root(store_root: &Path, watch_dirs: &[PathBuf], stop: Arc<Atomic
         }
     }
 
-    // 5. GC lúc start + thread GC định kỳ (daemon lifetime — không cần dừng gọn).
+    // 5. GC at start + a periodic GC thread (daemon lifetime — no graceful stop needed).
     run_gc(&engine, "lúc start");
     let gc_engine = engine.clone();
     let gc_stop = stop.clone();
@@ -162,8 +198,9 @@ pub fn run_with_root(store_root: &Path, watch_dirs: &[PathBuf], stop: Arc<Atomic
         }
     })?;
 
-    // 6. Vòng collector: event mới → debounce map; mỗi lần dậy phát path yên tĩnh ≥ DEBOUNCE_MS.
-    //    Xử lý ngay trong thread này (giữ đơn giản); mọi lỗi record đều log + bỏ qua.
+    // 6. Collector loop: new events → debounce map; on each wake, flush paths quiet ≥
+    //    DEBOUNCE_MS. Handled inline in this thread (kept simple); every record error is
+    //    logged and ignored.
     let mut last_event: HashMap<String, Instant> = HashMap::new();
     let debounce = Duration::from_millis(DEBOUNCE_MS);
     let tick = Duration::from_millis(COLLECTOR_INTERVAL_MS);
@@ -171,45 +208,58 @@ pub fn run_with_root(store_root: &Path, watch_dirs: &[PathBuf], stop: Arc<Atomic
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        // Tray pause (read once per tick): dropped events are not debounced at all, and the
+        // debounce map is cleared each tick so nothing pending leaks through on resume.
+        let paused = pause.load(Ordering::Relaxed);
         match rx.recv_timeout(tick) {
-            Ok(Ok(event)) => collect_event(&mut last_event, &event, &ws_entries),
+            Ok(Ok(event)) => {
+                if !paused {
+                    collect_event(&mut last_event, &event, &ws_entries);
+                }
+            }
             Ok(Err(e)) => log::warn!("watcher lỗi (bỏ qua): {e}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break, // watcher đã drop
+            Err(mpsc::RecvTimeoutError::Disconnected) => break, // watcher dropped
         }
-        drain_ready(&mut last_event, debounce, &engine, &ws_entries);
+        if paused {
+            last_event.clear();
+        } else {
+            drain_ready(&mut last_event, debounce, &engine, &ws_entries);
+        }
     }
 
-    // 7. Dọn status (best effort). daemon.lock để lại — lock tự nhả khi process chết.
+    // 7. Clean up the status file (best effort). daemon.lock is left behind — the lock
+    //    releases itself when the process dies.
     let _ = std::fs::remove_file(store_root.join("daemon.json"));
     log::info!("daemon dừng sạch");
     Ok(())
 }
 
-/// Tiện ích cho main.rs: chạy với store root mặc định của engine (env `LOCAL_HISTORY_DIR`
-/// hoặc `%LOCALAPPDATA%\local-history`).
+/// Convenience for main.rs: runs with the engine's default store root (env `LOCAL_HISTORY_DIR`
+/// or `%LOCALAPPDATA%\local-history`).
 pub fn run(watch_dirs: &[PathBuf], stop: Arc<AtomicBool>) -> Result<()> {
     let root = LocalHistory::default_root()?;
     run_with_root(&root, watch_dirs, stop)
 }
 
-/// Đọc trạng thái daemon (`<store_root>/daemon.json`). File thiếu/hỏng → `None`.
+/// Reads the daemon status (`<store_root>/daemon.json`). Missing or corrupt file → `None`.
 pub fn read_status(store_root: &Path) -> Option<DaemonStatus> {
     let data = std::fs::read_to_string(store_root.join("daemon.json")).ok()?;
     serde_json::from_str(&data).ok()
 }
 
-/// true nếu BẤT KỲ path component nào thuộc `IGNORE_DIRS`. Dùng cho filter trước debounce.
+/// true if ANY path component is in `IGNORE_DIRS`. Used by the pre-debounce filter.
 pub fn is_ignored(path: &Path) -> bool {
     path.components().any(|c| {
         IGNORE_DIRS.iter().any(|d| c.as_os_str().eq_ignore_ascii_case(*d))
     })
 }
 
-// ---------- nội bộ ----------
+// ---------- internals ----------
 
-/// Filter theo component TƯƠNG ĐỐI với watched root — tránh false positive khi đường tuyệt đối
-/// phía trên root tình cờ chứa tên trong `IGNORE_DIRS` (vd chạy daemon trong `target/`).
+/// Ignore filter applied RELATIVE to the watched root — avoids false positives when an
+/// absolute path above the root happens to contain an `IGNORE_DIRS` name (e.g. running the
+/// daemon inside `target/`).
 fn is_ignored_under(path: &Path, root: &Path) -> bool {
     match path.strip_prefix(root) {
         Ok(rel) => is_ignored(rel),
@@ -217,7 +267,7 @@ fn is_ignored_under(path: &Path, root: &Path) -> bool {
     }
 }
 
-/// path có nằm TRONG `dir` (so component, không phân biệt hoa thường trên Windows)?
+/// true if `path` lies INSIDE `dir` (component comparison, case-insensitive on Windows).
 fn under_dir(path: &Path, dir: &Path) -> bool {
     let pc: Vec<_> = path.components().collect();
     let dc: Vec<_> = dir.components().collect();
@@ -231,7 +281,7 @@ fn under_dir(path: &Path, dir: &Path) -> bool {
         })
 }
 
-/// Canonicalize + strip prefix `\\?\` của Windows (giữ UNC `\\?\UNC\...` → `\\...`).
+/// Canonicalize + strip the Windows `\\?\` prefix (UNC `\\?\UNC\...` → `\\...`).
 fn normalize_path(p: &Path) -> std::result::Result<PathBuf, String> {
     let canonical = p.canonicalize().map_err(|e| format!("{}: {e}", p.display()))?;
     let s = canonical.to_string_lossy();
@@ -244,7 +294,7 @@ fn normalize_path(p: &Path) -> std::result::Result<PathBuf, String> {
     }
 }
 
-/// unix micros UTC hiện tại.
+/// Current UTC time as unix microseconds.
 fn now_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -259,7 +309,7 @@ fn run_gc(engine: &LocalHistory, when: &str) {
     }
 }
 
-/// Watcher setup thất bại: dọn daemon.json (best effort) rồi trả lỗi.
+/// Watcher setup failed: remove daemon.json (best effort), then return the error.
 fn watcher_failed(store_root: &Path, e: DaemonError) -> DaemonError {
     let _ = std::fs::remove_file(store_root.join("daemon.json"));
     e
@@ -272,8 +322,9 @@ fn write_status(store_root: &Path, status: &DaemonStatus) -> Result<()> {
     Ok(())
 }
 
-/// Nhận 1 event: chỉ Create/Modify/Remove (bỏ Access/Other); path phải qua filter ignore và
-/// thuộc 1 watch dir đã đăng ký. Event mới về cùng path reset đồng hồ debounce.
+/// Absorbs one event: only Create/Modify/Remove are kept (Access/Other dropped); the path
+/// must pass the ignore filter and belong to a registered watch dir. A new event on the same
+/// path resets its debounce clock.
 fn collect_event(
     last_event: &mut HashMap<String, Instant>,
     event: &notify::Event,
@@ -297,7 +348,7 @@ fn collect_event(
     }
 }
 
-/// Phát các path đã yên tĩnh ≥ `debounce` ra xử lý — ngay trong thread collector (giữ đơn giản).
+/// Flushes paths quiet ≥ `debounce` for processing — inline in the collector thread (kept simple).
 fn drain_ready(
     last_event: &mut HashMap<String, Instant>,
     debounce: Duration,
@@ -316,8 +367,8 @@ fn drain_ready(
     }
 }
 
-/// Xử lý 1 path sau debounce. KHÔNG BAO GIỜ panic — mọi lỗi log + bỏ qua (daemon phải sống
-/// sót qua file lởm chởm / đang bị khóa ghi).
+/// Processes one path after its debounce. NEVER panics — every error is logged and ignored
+/// (the daemon must survive half-written / write-locked files).
 fn process_one(engine: &LocalHistory, ws_entries: &[(PathBuf, WorkspaceId)], path_str: &str) {
     let path = PathBuf::from(path_str);
     let Some(&ws) = ws_entries
@@ -330,22 +381,22 @@ fn process_one(engine: &LocalHistory, ws_entries: &[(PathBuf, WorkspaceId)], pat
 
     if path.exists() {
         if !path.is_file() {
-            return; // thư mục mới tạo — chỉ quan tâm file
+            return; // newly created directory — only files matter
         }
-        // Đang bị khóa ghi → đọc lỗi → bỏ qua; event sau (nếu còn thay đổi) sẽ ghi lại.
+        // Write-locked → read fails → skip; a later event (if the file changed again) records it.
         match std::fs::read(&path) {
             Ok(content) => {
                 match engine.record(ws, &path, &content, EventKind::External, None) {
                     Ok(Some(_)) => log::info!("đã record (external): {path_str}"),
-                    Ok(None) => {} // dedup trong engine — không tạo version thừa
+                    Ok(None) => {} // deduped in the engine — no redundant version
                     Err(e) => log::warn!("record {path_str} lỗi (bỏ qua): {e}"),
                 }
             }
             Err(e) => log::warn!("đọc {path_str} lỗi (bỏ qua): {e}"),
         }
     } else {
-        // File biến mất: chỉ ghi marker delete khi file có row trong files table của ws
-        // (tránh ghi rác cho thư mục tạm / file chưa từng track).
+        // File vanished: write the delete marker only if the file has a row in the workspace's
+        // files table (avoids noise for temp dirs / files never tracked).
         match engine.history(ws, &path) {
             Ok(versions) if !versions.is_empty() => {
                 match engine.record(ws, &path, &[], EventKind::Delete, None) {
@@ -353,7 +404,7 @@ fn process_one(engine: &LocalHistory, ws_entries: &[(PathBuf, WorkspaceId)], pat
                     Err(e) => log::warn!("record delete {path_str} lỗi (bỏ qua): {e}"),
                 }
             }
-            Ok(_) => {} // chưa từng có lịch sử — bỏ qua
+            Ok(_) => {} // never had history — skip
             Err(e) => log::warn!("history {path_str} lỗi (bỏ qua): {e}"),
         }
     }

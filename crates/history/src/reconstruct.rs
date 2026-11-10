@@ -1,16 +1,18 @@
-//! reconstruct — tái tạo nội dung của một version: walk ngược chain delta tới Full gần nhất,
-//! decompress Full rồi áp các delta xuôi theo seq (mỗi bước là splice mảng dòng, xem `patch`).
+//! Rebuilds the content of a version: walk backwards through the delta chain to the nearest
+//! full snapshot, decompress it, then apply the deltas forward by seq (each step is a line
+//! splice — see `patch`).
 
 use crate::model::*;
 use crate::patch;
 use crate::store::{row_to_version, LocalHistory};
 
-/// Giới hạn kích thước giải nén một blob — chặn blob hỏng/zip-bomb.
-/// Full ≤ 10MB, delta (JSON hunks) nhỏ hơn nhiều → 2 * MAX_FILE_SIZE + 64KB là dư địa.
+/// Decompression size limit for one blob — caps corrupt blobs / zip bombs.
+/// Fulls are at most 10 MB and delta JSON is far smaller, so `2 * MAX_FILE_SIZE + 64 KiB`
+/// is ample headroom.
 const DECOMPRESS_BOUND: usize = (MAX_FILE_SIZE as usize) * 2 + 64 * 1024;
 
 impl LocalHistory {
-    /// Đọc + giải nén blob của một version.
+    /// Reads and decompresses the blob of a version.
     pub(crate) fn load_blob(&self, ws: WorkspaceId, v: &Version) -> Result<Vec<u8>> {
         let path = self.blob_path(ws, v.id, v.storage);
         let compressed = match std::fs::read(&path) {
@@ -23,7 +25,7 @@ impl LocalHistory {
         Ok(zstd::bulk::decompress(&compressed, DECOMPRESS_BOUND)?)
     }
 
-    /// Lấy version theo id (join `files` để biết workspace của nó).
+    /// Fetches a version by id (joins `files` to learn its workspace).
     pub(crate) fn version_by_id(&self, id: VersionId) -> Result<Version> {
         Ok(self.version_by_id_with_ws(id)?.0)
     }
@@ -46,7 +48,7 @@ impl LocalHistory {
         })
     }
 
-    /// Version theo (file_id, seq). Thiếu row giữa chain → chain hỏng, không phải NotFound.
+    /// Version by `(file_id, seq)`. A missing row inside a chain is corruption, not NotFound.
     fn version_by_seq(&self, file_id: FileId, seq: i64) -> Result<Version> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -63,8 +65,9 @@ impl LocalHistory {
         })
     }
 
-    /// Nội dung đầy đủ của một version: walk ngược về Full gần nhất, decompress, áp delta
-    /// xuôi theo seq tăng dần. base_seq phải khớp liên tục (seq - 1) — lệch → CorruptChain.
+    /// Full content of a version: walk back to the nearest full, decompress, then apply the
+    /// deltas forward by ascending seq. `base_seq` must equal `seq - 1` at every step —
+    /// a gap is `CorruptChain`.
     pub fn content(&self, version_id: VersionId) -> Result<Vec<u8>> {
         let (mut cur, ws) = self.version_by_id_with_ws(version_id)?;
         let mut deltas: Vec<Version> = Vec::new();
@@ -87,7 +90,7 @@ impl LocalHistory {
                 }
             }
         }
-        // `cur` giờ là Full gần nhất dưới chain
+        // `cur` is now the nearest full below the chain
         let mut data = self.load_blob(ws, &cur)?;
         for dv in deltas.iter().rev() {
             let raw = self.load_blob(ws, dv)?;
@@ -97,7 +100,7 @@ impl LocalHistory {
         Ok(data)
     }
 
-    /// Nội dung của version mới nhất của file — dùng trong `record` để sinh delta.
+    /// Content of a file's newest version — used by `record` to build deltas.
     pub(crate) fn latest_content(&self, file_id: FileId) -> Result<Option<(Version, Vec<u8>)>> {
         let latest: Option<Version> = {
             let conn = self.conn.lock().unwrap();

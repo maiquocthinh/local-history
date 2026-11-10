@@ -1,14 +1,14 @@
-//! local-history engine — lịch sử thay đổi file dạng version chain (delta nén + full snapshot),
-//! độc lập với VCS. Được dùng chung bởi daemon, CLI, GUI, và về sau nhúng thẳng vào Wu.
+//! local-history engine — per-file change history as version chains (compressed deltas +
+//! full snapshots), independent of VCS. Shared by the daemon, CLI, and GUI.
 //!
-//! Kiến trúc lưu trử: xem `docs/architecture.md`.
-//! - `store`       — mở index SQLite, migration, đăng ký workspace, query dùng chung
-//! - `model`       — kiểu dữ liệu hợp đồng (Version, Hunk, EventKind...)
-//! - `record`      — ghi version mới (dedup blake3, binary detect, chọn full/delta, transaction)
-//! - `patch`       — structured patch: sinh + apply hunks (định dạng delta trên disk)
-//! - `reconstruct` — walk chain full→delta tái tạo nội dung version bất kỳ
-//! - `diff`        — unified diff (text) + hunks có cấu trúc (GUI render)
-//! - `retention`   — GC theo ngày làm việc + sweep blob mồ côi
+//! Storage architecture: see `docs/architecture.md`.
+//! - `store`       — SQLite index, schema migration, workspace registration, shared queries
+//! - `model`       — shared data types (Version, Hunk, EventKind, ...)
+//! - `record`      — writes new versions (blake3 dedup, binary detection, full/delta policy, transactional)
+//! - `patch`       — structured patch: hunk generation and apply (the on-disk delta format)
+//! - `reconstruct` — walks full→delta chains to rebuild any version's content
+//! - `diff`        — unified text diff + structured hunks (GUI rendering)
+//! - `retention`   — working-day GC + orphan blob sweep
 
 pub mod model;
 pub mod store;

@@ -1,0 +1,13 @@
+# Chuỗi tiếng Việt cho chế độ tray của `lh-daemon` (--tray).
+# Format: mỗi file chứa đúng 1 cây YAML; locale là tên file (vi.yml → "vi").
+# Map lồng được flatten thành key có dấu chấm (tray.open_gui, ...).
+# Quy tắc: tập key ở đây phải trùng khớp en.yml — kiểm bởi test
+# `i18n_yml_key_parity_and_cover_t_calls` trong crates/daemon/src/tray.rs.
+# `%{name}` = placeholder. Value là chuỗi double-quoted nằm trọn 1 dòng.
+tray:
+  tooltip: "daemon local-history — chuột phải để mở menu, nhấp đúp để mở GUI"
+  open_gui: "Mở GUI"
+  pause_watch: "Tạm dừng watch"
+  resume_watch: "Tiếp tục watch"
+  gc_now: "Dọn lịch sử"
+  quit: "Thoát"

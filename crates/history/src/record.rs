@@ -1,11 +1,13 @@
-//! record — ghi version mới vào chain: dedup blake3, phát hiện binary, chính sách full/delta,
-//! ghi blob atomic (`.tmp` + rename) và INSERT trong một transaction.
+//! Writes new versions onto the chain: blake3 dedup, binary detection, the full/delta
+//! policy, atomic blob writes (`.tmp` + rename) and the INSERT inside one transaction.
 //!
-//! Chính sách (docs/architecture.md §3.4):
-//! - `Delete` → luôn full với nội dung RỖNG (marker; blob vẫn ghi để giữ bất biến row⇒blob).
-//! - Binary (có NUL trong 8KB đầu hoặc không phải UTF-8) → chỉ full.
-//! - Text → full nếu version đầu của file, hoặc chain delta đã ≥ 20, hoặc patch JSON
-//!   ≥ 1/2 nội dung; còn không → delta với `base_seq` = seq của version mới nhất.
+//! Policy (docs/architecture.md §3.4):
+//! - `Delete` → always full with EMPTY content (marker; the blob is still written to keep
+//!   the row⇔blob invariant).
+//! - Binary (a NUL byte in the first 8 KiB, or invalid UTF-8) → full only.
+//! - Text → full if it is the file's first version, if the delta chain already has >= 20
+//!   entries, or if the patch JSON is >= 1/2 of the content; otherwise a delta with
+//!   `base_seq` = the latest version's seq.
 
 use std::path::Path;
 
@@ -13,7 +15,8 @@ use crate::model::*;
 use crate::patch;
 use crate::store::{now_micros, row_to_version, LocalHistory};
 
-/// Ghi blob atomic: tạo thư mục, ghi file `.tmp` rồi rename lên đường cuối.
+/// Writes a blob atomically: create the directory, write a `.tmp` file, then rename over
+/// the final path.
 fn write_blob_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "blob path không có thư mục cha")
@@ -25,8 +28,9 @@ fn write_blob_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 impl LocalHistory {
-    /// Ghi một version mới cho `file` với `content`. Trả `Ok(None)` nếu bị bỏ qua
-    /// (file quá lớn hoặc trùng version mới nhất — dedup).
+    /// Records a new version of `file` with `content`.
+    /// Returns `Ok(None)` when the write is skipped (file too large, or identical to the
+    /// latest version — dedup).
     pub fn record(
         &self,
         ws: WorkspaceId,
@@ -35,17 +39,15 @@ impl LocalHistory {
         kind: EventKind,
         label: Option<&str>,
     ) -> Result<Option<VersionId>> {
-        // 1. rel_path chuẩn hóa (phân tách '/')
         let rel = self.resolve_rel_path(ws, file)?;
 
-        // 2. Quá giới hạn kích thước → bỏ qua, không record.
         if content.len() as u64 > MAX_FILE_SIZE {
             log::warn!("bỏ qua record ({}): lớn hơn MAX_FILE_SIZE", file.display());
             return Ok(None);
         }
 
-        // Trạng thái hiện tại của file: files row, version mới nhất, chuỗi delta liên tiếp
-        // ngay trước (một lock ngắn, không giữ lock qua các đoạn nặng phía sau).
+        // Current state of the file: files row, latest version, and the run of consecutive
+        // deltas right before it (one short lock — not held across the heavy work below).
         let (file_id, latest, chain): (Option<FileId>, Option<Version>, i64) = {
             let conn = self.conn.lock().unwrap();
             let file_id: Option<FileId> = match conn.query_row(
@@ -70,11 +72,12 @@ impl LocalHistory {
                     Err(e) => return Err(e.into()),
                 },
             };
-            // Đi từ latest lên tới Full (hoặc hết) — đếm các version storage=Delta liên tiếp.
+            // Walk from latest back to the last full (or the start), counting consecutive
+            // delta versions.
             let chain = match file_id {
                 None => 0,
                 Some(fid) => {
-                    // 20 delta là đủ quyết định (chain >= 20 → full), 21 để chắc chắn.
+                    // 20 consecutive deltas force a full; peek at 21 to be certain.
                     let mut stmt = conn.prepare(
                         "SELECT storage FROM versions WHERE file_id = ?1 ORDER BY seq DESC LIMIT 21",
                     )?;
@@ -92,11 +95,10 @@ impl LocalHistory {
             (file_id, latest, chain)
         };
 
-        // 3. Hash nội dung (blake3 hex lowercase).
         let hash = blake3::hash(content).to_hex().to_string();
 
-        // 4. Dedup: trùng hash + kind với version mới nhất → không tạo version.
-        //    Riêng Delete: latest cũng là Delete thì bỏ qua dù nội dung gì.
+        // Dedup: same hash + kind as the latest version → no new version.
+        // Delete is special: if the latest is already a Delete, skip regardless of content.
         let dup = match &latest {
             Some(l) if kind == EventKind::Delete => l.kind == EventKind::Delete,
             Some(l) => l.kind == kind && l.content_hash == hash,
@@ -106,19 +108,19 @@ impl LocalHistory {
             return Ok(None);
         }
 
-        // 5. Binary detect: không có byte 0 trong 8KB đầu VÀ toàn bộ nội dung là UTF-8 hợp lệ.
+        // Text detection: no NUL byte in the first 8 KiB AND the whole content is valid UTF-8.
         let is_text = !content[..content.len().min(8192)].contains(&0u8)
             && std::str::from_utf8(content).is_ok();
 
-        // 6-7. Chọn full/delta + nội dung blob (full = nội dung; delta = JSON hunks).
+        // Pick full/delta + the blob payload (full = content; delta = hunk JSON).
         let (storage, base_seq, blob_data) = if kind == EventKind::Delete {
-            // Delete: luôn full, nội dung rỗng làm marker.
+            // Delete: always full, empty content as the marker.
             (Storage::Full, None, Vec::new())
         } else if !is_text {
-            // Binary: chỉ full.
+            // Binary: full only.
             (Storage::Full, None, content.to_vec())
         } else if let Some(fid) = file_id {
-            // File đã có lịch sử — thử delta lên nội dung mới nhất.
+            // File already has history — try a delta against its latest content.
             match self.latest_content(fid)? {
                 Some((lv, old)) => {
                     let hunks = patch::make_patch(&old, content)?;
@@ -129,19 +131,20 @@ impl LocalHistory {
                         (Storage::Delta, Some(lv.seq), json)
                     }
                 }
-                // Row file có nhưng chưa có version nào (hiếm) → full đầu tiên.
+                // File row exists but has no version yet (rare) → first full.
                 None => (Storage::Full, None, content.to_vec()),
             }
         } else {
-            // Version đầu của file → full.
+            // First version of the file → full.
             (Storage::Full, None, content.to_vec())
         };
 
-        // `size` = kích thước nội dung sau khi tái tạo: marker Delete tái tạo thành rỗng.
+        // `size` = reconstructed content size: a Delete marker reconstructs to empty.
         let size: u64 = if kind == EventKind::Delete { 0 } else { content.len() as u64 };
 
-        // 8. Transaction: INSERT files (nếu thiếu) → INSERT versions → ghi blob → UPDATE
-        //    current_seq → COMMIT. Blob lỗi → rollback (crash chỉ để lại blob mồ côi, GC dọn).
+        // Transaction: INSERT files (if missing) → INSERT versions → write blob →
+        // UPDATE current_seq → COMMIT. A blob failure rolls back; a crash only leaves an
+        // orphan blob for GC.
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
@@ -188,11 +191,12 @@ impl LocalHistory {
         Ok(Some(version_id))
     }
 
-    /// Revert `file` về nội dung của `version_id`.
+    /// Reverts `file` to the content of `version_id`.
     ///
-    /// Luôn an toàn: nếu disk khác target, snapshot trạng thái hiện tại với kind=`pre_revert`
-    /// TRƯỚC khi ghi đè; sau đó ghi target với kind=`restore`. Version phải thuộc đúng
-    /// (ws, file) — ngược lại `Error::NotFound`.
+    /// Always safe: if disk differs from the target, the current state is snapshotted with
+    /// kind `pre_revert` BEFORE the overwrite; the target is then written with kind
+    /// `restore`. The version must belong to the given (workspace, file) pair — otherwise
+    /// `Error::NotFound`.
     pub fn revert(&self, ws: WorkspaceId, file: &Path, version_id: VersionId) -> Result<()> {
         let rel = self.resolve_rel_path(ws, file)?;
         let target_v = self.version_by_id(version_id)?;
@@ -216,13 +220,12 @@ impl LocalHistory {
         }
         let target = self.content(version_id)?;
 
-        // Disk đã giống target → không ghi gì cả.
         let cur = if file.exists() { Some(std::fs::read(file)?) } else { None };
         if cur.as_deref() == Some(target.as_slice()) {
             return Ok(());
         }
         if let Some(cur) = &cur {
-            // Snapshot an toàn TRƯỚC khi ghi đè.
+            // Safety snapshot before overwriting.
             self.record(ws, file, cur, EventKind::PreRevert, None)?;
         }
         if let Some(parent) = file.parent() {
@@ -233,8 +236,8 @@ impl LocalHistory {
         Ok(())
     }
 
-    /// Gắn label ngữ nghĩa: tạo version kind=`Label` với nội dung hiện tại trên disk.
-    /// File phải tồn tại trên disk.
+    /// Attaches a semantic label: creates a version of kind `Label` holding the current
+    /// disk content. The file must exist on disk.
     pub fn add_label(&self, ws: WorkspaceId, file: &Path, label: &str) -> Result<VersionId> {
         if !file.exists() {
             return Err(Error::NotFound(format!("file không tồn tại: {}", file.display())));
@@ -243,8 +246,8 @@ impl LocalHistory {
         match self.record(ws, file, &content, EventKind::Label, Some(label))? {
             Some(id) => Ok(id),
             None => {
-                // Bị dedup chặn (nội dung không đổi và latest đã là Label) — trả về id của
-                // version mới nhất hiện có.
+                // Blocked by dedup (content unchanged and the latest version is already a
+                // Label) — return the id of the existing latest version.
                 let rel = self.resolve_rel_path(ws, file)?;
                 let conn = self.conn.lock().unwrap();
                 match conn.query_row(
@@ -266,7 +269,7 @@ impl LocalHistory {
         }
     }
 
-    /// Đổi/xóa label của một version có sẵn (không tạo version mới).
+    /// Changes or clears the label of an existing version, without creating a new one.
     pub fn set_label(&self, version_id: VersionId, label: Option<&str>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(

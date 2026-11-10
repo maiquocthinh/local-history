@@ -1,4 +1,4 @@
-//! Entry mỏng của `lh` — parse args rồi gọi lib. Toàn bộ logic ở `lib.rs`.
+//! Thin entry point for `lh` — parses args and calls the lib. All logic lives in `lib.rs`.
 
 use clap::Parser;
 

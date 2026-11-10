@@ -1,10 +1,11 @@
-//! lh-gui — trình xem lịch sử file local-history (egui/eframe), dark theme.
+//! lh-gui — local-history desktop viewer (egui/eframe), dark theme.
 //!
-//! Chạy: `lh-gui [--file <path>]` — `--file` nhảy thẳng tới timeline của file
-//! (contract cho editor mở GUI).
+//! Usage: `lh-gui [--file <path>]` — `--file` opens straight into that file's
+//! timeline (the contract for editors launching the GUI).
 //!
-//! i18n: rust-i18n, locales = `locales/{en,vi}.yml` (locale = tên file), fallback "en".
-//! Ngôn ngữ chọn qua trường `"lang"` trong gui-state.json ("auto"|"en"|"vi").
+//! i18n: rust-i18n, locales in `locales/{en,vi}.yml` (locale = file name),
+//! fallback "en". The language is chosen via the `"lang"` field of
+//! gui-state.json ("auto"|"en"|"vi").
 
 mod app;
 mod diff_view;
@@ -17,12 +18,15 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-/// Args dòng lệnh — chỉ hỗ trợ `--file <path>`; tham số lạ bị bỏ qua.
+/// Command-line arguments. Only `--file <path>` is recognized; anything else
+/// is ignored.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Args {
+    /// Raw `--file` value, if present; normalized before use.
     pub file: Option<PathBuf>,
 }
 
+/// Parses raw argument strings (typically `env::args().skip(1)`) into [`Args`].
 pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Args {
     let mut out = Args::default();
     while let Some(a) = args.next() {
@@ -33,8 +37,9 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Args {
     out
 }
 
-/// Canonicalize nếu được (không được thì giữ nguyên); bỏ prefix `\\?\` của Windows
-/// (giữ UNC `\\?\UNC\...` → `\\...`) để hiển thị/match thân thiện.
+/// Canonicalizes the path when possible (falling back to the input as-is), then
+/// strips the Windows `\\?\` prefix (UNC `\\?\UNC\...` becomes `\\...`) so paths
+/// display and match in a friendly form.
 pub fn normalize_user_path(p: &Path) -> PathBuf {
     let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let s = canonical.as_os_str().to_string_lossy().to_string();
@@ -47,6 +52,14 @@ pub fn normalize_user_path(p: &Path) -> PathBuf {
     }
 }
 
+/// Window/taskbar icon: `assets/icon-128.png` decoded at startup. The exe
+/// resource icon is separate — see build.rs.
+fn window_icon() -> Option<egui::IconData> {
+    let img = image::load_from_memory(include_bytes!("../assets/icon-128.png")).ok()?;
+    let rgba = img.to_rgba8().into_raw();
+    Some(egui::IconData { width: img.width(), height: img.height(), rgba })
+}
+
 fn main() -> eframe::Result<()> {
     let args = parse_args(
         std::env::args_os()
@@ -57,10 +70,15 @@ fn main() -> eframe::Result<()> {
     let default_root = history::LocalHistory::default_root()
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
+    let mut viewport = egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]);
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
-        // Ép renderer Glow (OpenGL): wgpu/DX12 bị ACCESS_VIOLATION lúc khởi tạo trên
-        // máy GPU driver hạn chế / VM (crash 0xC0000005, stdout/stderr rỗng).
+        viewport,
+        // Force the Glow (OpenGL) renderer: wgpu/DX12 hits an ACCESS_VIOLATION
+        // during init on machines with limited GPU drivers or in VMs
+        // (crash 0xC0000005 with empty stdout/stderr).
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
@@ -68,9 +86,7 @@ fn main() -> eframe::Result<()> {
         "local-history",
         options,
         Box::new(move |cc| {
-            // Dark theme mặc định
             cc.egui_ctx.set_theme(egui::Theme::Dark);
-            // Material Icons làm font fallback (priority Lowest — chỉ dùng cho glyph icon)
             icons::install(&cc.egui_ctx);
             Ok(Box::new(app::App::new(default_root, initial_file)))
         }),
@@ -88,30 +104,29 @@ mod tests {
         assert_eq!(a.file, Some(PathBuf::from(r"D:\x\y.rs")));
         let a = parse_args(std::iter::empty());
         assert_eq!(a, Args::default());
-        // tham số lạ bỏ qua
         let a = parse_args(["--other", "1", "--file"].into_iter().map(String::from));
-        assert_eq!(a, Args::default(), "--file không có giá trị → None");
+        assert_eq!(a, Args::default(), "--file without a value → None");
     }
 
     #[test]
     fn normalize_keeps_missing_path_and_strips_prefix() {
-        // đường dẫn không tồn tại → giữ nguyên
-        let p = normalize_user_path(Path::new(r"D:\không\tồn\tại.rs"));
-        assert_eq!(p, PathBuf::from(r"D:\không\tồn\tại.rs"));
-        // đường dẫn thật của crate → canonicalize + bỏ prefix \\?\
+        // nonexistent path → returned as-is
+        let p = normalize_user_path(Path::new(r"D:\does\not\exist.rs"));
+        assert_eq!(p, PathBuf::from(r"D:\does\not\exist.rs"));
+        // a real crate path → canonicalized + `\\?\` prefix stripped
         let p = normalize_user_path(Path::new(env!("CARGO_MANIFEST_DIR")));
         let s = p.to_string_lossy();
-        assert!(!s.starts_with(r"\\?\"), "phải bỏ prefix \\\\?\\: {s}");
+        assert!(!s.starts_with(r"\\?\"), "must strip the \\\\?\\ prefix: {s}");
         assert!(p.ends_with("gui"));
     }
 
-    /// set_locale là trạng thái toàn cục của process — khóa để các test đổi locale không
-    /// đua với test khác đang đọc message.
+    /// `set_locale` is process-global state — this lock keeps locale-switching
+    /// tests from racing tests that read messages.
     static LOCALE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn i18n_lookup_vi_and_en() {
-        // tra cứu có ghi rõ locale — không đụng trạng thái toàn cục
+        // explicit-locale lookups — process-global state untouched
         assert_eq!(t!("status.ready", locale = "vi"), "Sẵn sàng.");
         assert_eq!(t!("status.ready", locale = "en"), "Ready.");
         assert_eq!(
@@ -137,13 +152,13 @@ mod tests {
     #[test]
     fn i18n_invalid_locale_falls_back_to_en() {
         let _guard = LOCALE_TEST_LOCK.lock().unwrap();
-        // locale không tồn tại trong locales/*.yml → rơi về fallback "en"
+        // a locale absent from locales/*.yml falls back to "en"
         rust_i18n::set_locale("fr");
         assert_eq!(t!("panel.search_hint"), "Search files…");
-        // đường đi thật của App::new/set_lang: set_locale("vi") rồi tra cứu không ghi rõ
+        // the real App::new/set_lang path: set_locale("vi") then an unannotated lookup
         rust_i18n::set_locale("vi");
         assert_eq!(t!("panel.search_hint"), "Tìm file…");
-        rust_i18n::set_locale("en"); // trả về mặc định cho test khác
+        rust_i18n::set_locale("en"); // restore the default for other tests
     }
 
     #[test]
@@ -151,18 +166,18 @@ mod tests {
         let en = yml_map(include_str!("../locales/en.yml"));
         let vi = yml_map(include_str!("../locales/vi.yml"));
 
-        // không có key trùng trong cùng 1 file (YAML trùng key bị nuốt im lặng)
+        // no duplicate keys within one file (YAML silently swallows duplicates)
         for (name, map) in [("en", &en), ("vi", &vi)] {
             let mut seen = std::collections::BTreeSet::new();
             for (k, _) in map {
-                assert!(seen.insert(k.clone()), "key `{k}` bị lặp trong {name}.yml");
+                assert!(seen.insert(k.clone()), "key `{k}` is duplicated in {name}.yml");
             }
         }
-        assert!(!en.is_empty(), "en.yml không có key nào");
+        assert!(!en.is_empty(), "en.yml defines no keys");
         assert_eq!(
             en.len(),
             vi.len(),
-            "số key en ({}) != số key vi ({})",
+            "en key count ({}) != vi key count ({})",
             en.len(),
             vi.len()
         );
@@ -170,12 +185,12 @@ mod tests {
         let only_vi: Vec<&String> = vi.iter().map(|(k, _)| k).filter(|k| !en.iter().any(|(k2, _)| k2 == *k)).collect();
         assert!(
             only_en.is_empty() && only_vi.is_empty(),
-            "2 file yml lệch tập key — chỉ có ở en: {only_en:?} · chỉ có ở vi: {only_vi:?}"
+            "yml key sets diverge — only in en: {only_en:?} · only in vi: {only_vi:?}"
         );
 
-        // mọi key được gọi dịch trong source của gui phải được định nghĩa trong yml,
-        // và TÊN tham số truyền vào t!() phải khớp đúng placeholder %{name} trong yml
-        // (lệch tên ⇒ placeholder không được thay, UI hiện nguyên văn "%{...}").
+        // every key translated in gui source must be defined in the yml, and the
+        // t!() ARGUMENT NAMES must match the %{name} placeholders exactly
+        // (a name mismatch leaves the placeholder unsubstituted, rendering "%{...}").
         let sources = [
             include_str!("main.rs"),
             include_str!("app.rs"),
@@ -190,7 +205,7 @@ mod tests {
                         .find(|(k, _)| k == &key)
                         .map(|(_, v)| v.clone())
                         .unwrap_or_else(|| {
-                            panic!("key `{key}` được gọi trong source nhưng không có trong {locale}.yml")
+                            panic!("key `{key}` used in source but missing from {locale}.yml")
                         })
                 };
                 let passed: std::collections::BTreeSet<String> =
@@ -199,19 +214,20 @@ mod tests {
                 let want_vi = placeholders_of(&value(&vi, "vi"), &key, "vi");
                 assert_eq!(
                     &passed, &want_en,
-                    "key `{key}`: tham số t!() {passed:?} lệch placeholder en.yml {want_en:?}"
+                    "key `{key}`: t!() args {passed:?} mismatch en.yml placeholders {want_en:?}"
                 );
                 assert_eq!(
                     &passed, &want_vi,
-                    "key `{key}`: tham số t!() {passed:?} lệch placeholder vi.yml {want_vi:?}"
+                    "key `{key}`: t!() args {passed:?} mismatch vi.yml placeholders {want_vi:?}"
                 );
             }
         }
     }
 
-    /// Parser tối giản đúng định dạng locales/*.yml của crate này: mỗi file là 1 cây YAML
-    /// (locale = tên file), map lồng nhiều cấp (namespace → nhóm → key), value là chuỗi
-    /// double-quoted nằm trọn 1 dòng. Trả về (key đầy đủ "a.b.c", value) theo thứ tự file.
+    /// Minimal parser matching this crate's locales/*.yml format: each file is one
+    /// YAML tree (locale = file name), nested maps (namespace → group → key), values
+    /// are double-quoted strings on a single line. Returns (full "a.b.c" key, value)
+    /// in file order.
     fn yml_map(yml: &str) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         let mut stack: Vec<(usize, &str)> = Vec::new();
@@ -223,7 +239,7 @@ mod tests {
             }
             let indent = trimmed.len() - body.len();
             let Some((k, v)) = body.split_once(':') else {
-                panic!("dòng YAML không ngờ (thiếu ':'): {line}");
+                panic!("unexpected YAML line (missing ':'): {line}");
             };
             let k = k.trim();
             let v = v.trim();
@@ -233,7 +249,7 @@ mod tests {
             if v.starts_with('"') {
                 assert!(
                     v.len() >= 2 && v.ends_with('"'),
-                    "value của `{k}` phải là chuỗi quoted trọn 1 dòng: {line}"
+                    "value of `{k}` must be a single-line quoted string: {line}"
                 );
                 let path: Vec<&str> = stack.iter().map(|(_, s)| *s).chain([k]).collect();
                 out.push((path.join("."), v[1..v.len() - 1].to_string()));
@@ -244,11 +260,11 @@ mod tests {
         out
     }
 
-    /// Quét source lấy mọi lệnh gọi macro dịch dạng `t!("key", name = expr, ...)`
-    /// — trả về (key, danh sách tên tham số theo thứ tự xuất hiện).
-    /// Bỏ qua dòng comment; chỉ nhận key namespaced (chữ/số/gạch dưới, có dấu chấm).
-    /// Nhiều macro chuẩn (`assert!`, `format!`...) cũng chứa chuỗi "t!(" — chỉ tiến
-    /// hành parse khi ngay sau `t!(` là một chuỗi quoted khớp hình dạng key.
+    /// Scans source for every translation call shaped like `t!("key", name = expr, ...)`,
+    /// returning (key, argument names in order of appearance). Comment lines are
+    /// skipped; only namespaced keys (alphanumerics, underscores, dashes, with a dot)
+    /// count. Other macros (`assert!`, `format!`, ...) also contain the text "t!(" —
+    /// parsing proceeds only when a quoted key-shaped string follows `t!(`.
     fn t_calls_in_source(src: &str) -> Vec<(String, Vec<String>)> {
         const PREFIX: &str = "t!(";
         let mut out = Vec::new();
@@ -263,7 +279,7 @@ mod tests {
                 i += 1;
             }
             if i >= bytes.len() || bytes[i] != b'"' {
-                continue; // assert!(/format!/... — không phải lệnh t! với key literal
+                continue; // assert!/format!/... — not a t! call with a literal key
             }
             let key_start = i + 1;
             let Some(key_end) = src[key_start..].find('"') else {
@@ -279,7 +295,7 @@ mod tests {
             {
                 continue;
             }
-            // quét tới dấu ')' đóng ở depth 0 — bỏ qua nội dung chuỗi quoted
+            // scan to the closing ')' at depth 0, skipping quoted string contents
             let mut args = Vec::new();
             let mut depth = 0usize;
             let mut seg_start = key_end + 1;
@@ -299,10 +315,10 @@ mod tests {
                     match c {
                         '"' => in_str = true,
                         '(' | '[' => depth += 1,
-                        ')' if depth == 0 => break, // đóng macro call
+                        ')' if depth == 0 => break,
                         ')' | ']' => depth -= 1,
                         ',' if depth == 0 => {
-                            // segment giữa các dấu phẩy top-level
+                            // segment between top-level commas
                             let seg = src[seg_start..j].trim();
                             if !seg.is_empty()
                                 && let Some(name) = top_level_arg_name(seg)
@@ -325,12 +341,12 @@ mod tests {
         out
     }
 
-    /// Tên tham số ở đầu một segment `name = expr` (bỏ qua `locale` — tham số của macro,
-    /// không phải placeholder). Trả None cho segment không có dạng `name =`.
+    /// Argument name at the start of a `name = expr` segment (skips `locale` — a macro
+    /// parameter, not a placeholder). Returns None for segments without the `name =` shape.
     fn top_level_arg_name(seg: &str) -> Option<String> {
         let eq = seg.find('=')?;
         let name = seg[..eq].trim();
-        // `==` so sánh — không phải gán tham số
+        // `==` is a comparison, not an argument assignment
         if seg[eq..].starts_with("==") || name.is_empty() {
             return None;
         }
@@ -346,7 +362,7 @@ mod tests {
         Some(name.to_string())
     }
 
-    /// Tập placeholder `%{name}` trong một giá trị yml.
+    /// Set of `%{name}` placeholders inside one yml value.
     fn placeholders_of(value: &str, key: &str, locale: &str)
     -> std::collections::BTreeSet<String> {
         let mut out = std::collections::BTreeSet::new();
@@ -354,7 +370,7 @@ mod tests {
         while let Some(p) = value[i..].find("%{") {
             let start = i + p + 2;
             let Some(end) = value[start..].find('}') else {
-                panic!("placeholder không đóng trong `{key}` ({locale}.yml)");
+                panic!("unclosed placeholder in `{key}` ({locale}.yml)");
             };
             let name = &value[start..start + end];
             assert!(
@@ -362,7 +378,7 @@ mod tests {
                     && name
                         .chars()
                         .all(|c| c.is_ascii_alphanumeric() || c == '_'),
-                "placeholder kỳ lạ trong `{key}` ({locale}.yml): %{name}"
+                "malformed placeholder in `{key}` ({locale}.yml)"
             );
             out.insert(name.to_string());
             i = start + end;

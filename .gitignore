@@ -2,3 +2,5 @@
 Cargo.lock.bak
 *.rs.bk
 docs/
+__pycache__/
+.zcode/

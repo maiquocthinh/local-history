@@ -53,6 +53,10 @@ diff:
   version_gone: "Version is no longer in the timeline (maybe GC'd)."
   version_right_gone: "The right-side version is no longer in the timeline."
   file_missing: "File is no longer on disk (deleted?)."
+  copy: "Copy diff"
+  copy_tip: "Copy the unified diff of this comparison to the clipboard"
+  copied: "Copied %{n} lines to the clipboard"
+  copied_diff: "Unified diff copied to the clipboard"
 store:
   missing_title: "No local-history store"
   missing_text: "Cannot open index.db at:\n%{path}"

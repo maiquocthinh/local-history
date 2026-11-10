@@ -1,22 +1,26 @@
-//! Diff view — dựng 2 mảng dòng trái/phải từ hunks có cấu trúc của engine và render
-//! side-by-side (một `ScrollArea::show_rows` duy nhất ⇒ scroll 2 pane tự đồng bộ).
+//! Diff view — builds the left/right line arrays from the engine's structured
+//! hunks and renders them side by side (a single `ScrollArea::show_rows` keeps
+//! both panes' scrolling in sync).
+
+use std::collections::BTreeSet;
 
 use eframe::egui;
 use history::Hunk;
 use rust_i18n::t;
 
-/// Cột diff: nền đỏ nhạt cho dòng bị xóa, xanh nhạt cho dòng thêm (theo đặc tả).
+/// Background of deleted lines (left side of a change).
 const DEL_BG: egui::Color32 = egui::Color32::from_rgb(60, 25, 25);
+/// Background of added lines (right side of a change).
 const ADD_BG: egui::Color32 = egui::Color32::from_rgb(25, 60, 30);
 const NUM_COLOR: egui::Color32 = egui::Color32::from_rgb(130, 130, 130);
 const TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(215, 215, 215);
 const SEP_STROKE: egui::Stroke =
     egui::Stroke { width: 1.0, color: egui::Color32::from_rgb(70, 70, 70) };
 const DIFF_FONT_SIZE: f32 = 13.0;
-/// Bề rộng cột số dòng.
+/// Width of the line-number gutter.
 const GUTTER: f32 = 56.0;
 
-/// Font monospace dùng cho diff (không nhúng font mới — dùng font mặc định của egui).
+/// Monospace font for diff text (no new embedded font — egui's built-in monospace).
 fn diff_font() -> egui::FontId {
     egui::FontId::monospace(DIFF_FONT_SIZE)
 }
@@ -25,16 +29,17 @@ fn num_font() -> egui::FontId {
     egui::FontId::monospace(DIFF_FONT_SIZE - 1.0)
 }
 
-/// Một dòng hiển thị trong pane diff.
+/// One line rendered in a diff pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
-    /// Nội dung dòng nguyên bản (gồm terminator — bỏ khi hiển thị).
+    /// Line content verbatim, including the terminator (stripped when rendering).
     pub text: String,
-    /// Số dòng 1-based trên nội dung của pane; None = dòng đệm khi 2 bên lệch độ dài.
+    /// 1-based line number within the pane's content; `None` for filler rows
+    /// that pad a length mismatch between the two sides.
     pub no: Option<usize>,
-    /// Dòng bị xóa (chỉ có ở bên trái của thay đổi).
+    /// Deleted line (appears on the left side of a change).
     pub del: bool,
-    /// Dòng được thêm (chỉ có ở bên phải của thay đổi).
+    /// Added line (appears on the right side of a change).
     pub add: bool,
 }
 
@@ -48,17 +53,19 @@ impl Line {
     fn add(text: &str, no: usize) -> Self {
         Line { text: text.to_string(), no: Some(no), del: false, add: true }
     }
-    /// Dòng đệm (lấp hàng khi 2 bên lệch độ dài) — trung tính, không tô màu.
+    /// Filler row padding a length mismatch — neutral, never colored.
     fn filler() -> Self {
         Line { text: String::new(), no: None, del: false, add: false }
     }
 }
 
-/// Dựng 2 mảng dòng (trái = base/old, phải = target/new) từ hunks, theo đúng ngữ nghĩa
-/// splice của `model::Hunk`: hunk thay `base[old_start-1 .. old_start-1+old_lines]` bằng
-/// `target[new_start-1 .. new_start-1+new_lines]`, các hunk tăng dần `old_start` (đầu ra
-/// chuẩn của engine). Dòng context ghép cặp 1-1; vùng thay đổi ghép theo thứ tự, bên nào
-/// ngắn hơn nhận dòng đệm (text rỗng, `no = None`) để 2 pane thẳng hàng theo hàng.
+/// Builds the two line arrays (left = base/old, right = target/new) from hunks,
+/// following `model::Hunk` splice semantics: a hunk replaces
+/// `base[old_start-1 .. old_start-1+old_lines]` with
+/// `target[new_start-1 .. new_start-1+new_lines]`, and hunks arrive with
+/// ascending `old_start` (the engine's canonical output). Context lines pair
+/// 1:1; within a change region sides pair in order and the shorter side gets
+/// filler rows (empty text, `no = None`) so both panes stay row-aligned.
 pub fn apply_hunks_to_sides(
     base_lines: &[&str],
     target_lines: &[&str],
@@ -76,21 +83,22 @@ pub fn apply_hunks_to_sides(
         right.push(Line::context(target, target_no));
     };
 
-    let mut oi = 0usize; // dòng base đã duyệt
-    let mut ni = 0usize; // dòng target đã duyệt
+    let mut oi = 0usize; // base lines consumed
+    let mut ni = 0usize; // target lines consumed
     for h in hunks {
         let s = (h.old_start as usize).saturating_sub(1).min(base_lines.len());
-        // context giữa hunk trước và hunk này
+        // context between the previous hunk and this one
         let ctx = s.saturating_sub(oi);
         for i in 0..ctx {
             let b = base_lines.get(oi + i).copied().unwrap_or("");
             let t = target_lines.get(ni + i).copied().unwrap_or("");
             push_context(&mut left, &mut right, b, oi + i + 1, t, ni + i + 1);
         }
-        ni += ctx; // oi nhảy thẳng tới cuối vùng del của hunk (s + del_n)
+        ni += ctx; // oi is left alone — it jumps straight to s + del_n after the hunk
 
-        // vùng thay đổi: del ở trái (đúng i < old_lines), add ở phải (đúng i < new_lines),
-        // đệm cho bên ngắn hơn — KHÔNG tiêu dòng của bên không tham gia hunk.
+        // change region: del on the left (only i < old_lines), add on the right
+        // (only i < new_lines); the shorter side is padded and the side not
+        // participating in the hunk consumes no lines.
         let del_n = h.old_lines as usize;
         let add_n = h.new_lines as usize;
         for i in 0..del_n.max(add_n) {
@@ -106,7 +114,7 @@ pub fn apply_hunks_to_sides(
         oi = s + del_n;
         ni += add_n;
     }
-    // context sau hunk cuối
+    // context after the last hunk
     let tail = base_lines.len().saturating_sub(oi);
     for i in 0..tail {
         let b = base_lines.get(oi + i).copied().unwrap_or("");
@@ -116,28 +124,34 @@ pub fn apply_hunks_to_sides(
     (left, right)
 }
 
-/// Model diff hoàn chỉnh cho khung hiển thị (do `app` dựng từ engine + disk).
+/// Complete diff model for the viewer, built by `app` from engine + disk data.
 #[derive(Debug, Clone, Default)]
 pub struct DiffModel {
+    /// Heading of the left pane.
     pub left_title: String,
+    /// Heading of the right pane.
     pub right_title: String,
+    /// Left (old) pane lines.
     pub left: Vec<Line>,
+    /// Right (new) pane lines.
     pub right: Vec<Line>,
-    /// Nội dung binary — không diff được.
+    /// Content is binary and cannot be diffed.
     pub binary: bool,
-    /// Thông báo trạng thái (chưa chọn file, version đầu tiên...).
+    /// Status message (no file selected, first version, ...).
     pub note: Option<String>,
-    /// Hai bên giống hệt nhau (0 hunk).
+    /// Both sides are identical (zero hunks).
     pub identical: bool,
-    /// Số ký tự dòng dài nhất (để tính bề rộng ngang của cell).
+    /// Character count of the longest line (drives the horizontal cell width).
     pub max_chars: usize,
 }
 
 impl DiffModel {
+    /// Model that only shows a status note, with empty panes.
     pub fn empty_note(note: impl Into<String>) -> Self {
         DiffModel { note: Some(note.into()), ..Default::default() }
     }
 
+    /// Model for binary content: shows the "binary" note only.
     pub fn binary_note() -> Self {
         DiffModel {
             binary: true,
@@ -146,7 +160,7 @@ impl DiffModel {
         }
     }
 
-    /// Số ký tự của dòng dài nhất trên 2 bên (để cấp bề rộng ngang).
+    /// Recomputes `max_chars` from both sides (drives the horizontal cell width).
     pub fn compute_max_chars(&mut self) {
         self.max_chars = self
             .left
@@ -157,15 +171,140 @@ impl DiffModel {
             .unwrap_or(0);
     }
 
-    /// Hoàn tất sau khi dựng: tính max_chars.
+    /// Finishes a freshly built model by computing `max_chars`.
     pub fn finished(mut self) -> Self {
         self.compute_max_chars();
         self
     }
 }
 
-/// Render model diff vào panel giữa: tiêu đề 2 cột + các dòng side-by-side.
-pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel) {
+// ---------------------------------------------------------------------------
+// Line selection (click / ctrl+click / shift+click) + raw-text copy
+// ---------------------------------------------------------------------------
+
+// ponytail: no drag-select of text WITHIN a diff line (char-level selection) — selection is line-level only.
+
+/// Which pane a selected diff line belongs to. Enum order = display order of
+/// the panes (the left cell is drawn before the right cell of a row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Pane {
+    /// Old side (left cell of a diff row).
+    Left,
+    /// New side (right cell of a diff row).
+    Right,
+}
+
+/// One selected diff line. Field order defines the sort order: `row` FIRST ⇒ a
+/// `BTreeSet<SelLine>` iterates in DISPLAY order (row-major, left before
+/// right) — exactly the order copied text uses. Do not swap the fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SelLine {
+    /// Row index in the diff grid (both panes share the same row indexes).
+    pub row: usize,
+    /// Pane the line was clicked in.
+    pub pane: Pane,
+}
+
+/// Line-level selection of the diff view: the highlighted rows plus the anchor
+/// for shift+click ranges. Reset to empty whenever the diff pair changes
+/// (`app::diff_panel` does this when its cached diff key goes stale); rows left
+/// over from an older, longer pair are also tolerated at copy time (skipped,
+/// never panic).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffSelection {
+    /// Selected lines, iterated in display order regardless of click order.
+    pub lines: BTreeSet<SelLine>,
+    /// Last plain/ctrl-clicked line; the fixed origin of shift+click ranges
+    /// (shift+click does NOT move it, so repeated shift+clicks keep extending
+    /// from the same origin).
+    pub anchor: Option<SelLine>,
+}
+
+impl DiffSelection {
+    /// Whether the given cell is selected.
+    pub fn contains(&self, pane: Pane, row: usize) -> bool {
+        self.lines.contains(&SelLine { row, pane })
+    }
+}
+
+/// Mouse modifiers of a click on a diff row (a plain struct so the click rules
+/// are unit-testable without a real event system).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClickMods {
+    /// Ctrl held: toggle the clicked line in/out of the selection.
+    pub ctrl: bool,
+    /// Shift held: select the display-order range from the anchor to the click.
+    pub shift: bool,
+}
+
+/// Applies one click on a diff row:
+/// plain click = select only that line (anchor moves); ctrl+click = toggle that
+/// line (anchor moves); shift+click = select the display-order range from the
+/// anchor to the click, REPLACING the selection (anchor stays; a missing anchor
+/// behaves like a plain click).
+pub fn apply_click(sel: &mut DiffSelection, clicked: SelLine, mods: ClickMods) {
+    if mods.ctrl {
+        if !sel.lines.remove(&clicked) {
+            sel.lines.insert(clicked);
+        }
+        sel.anchor = Some(clicked);
+    } else if mods.shift {
+        let start = sel.anchor.unwrap_or(clicked);
+        let (lo, hi) = if start <= clicked { (start, clicked) } else { (clicked, start) };
+        let mut lines = BTreeSet::new();
+        let mut cur = lo;
+        loop {
+            lines.insert(cur);
+            if cur >= hi {
+                break;
+            }
+            cur = next_display_line(cur);
+        }
+        sel.lines = lines;
+    } else {
+        *sel = DiffSelection { lines: BTreeSet::from([clicked]), anchor: Some(clicked) };
+    }
+}
+
+/// Next line in display order (row-major, left before right): the right cell of
+/// the same row, else the left cell of the next row. Rows beyond the model are
+/// harmless — they are filtered out at copy time — so no bound check is needed.
+fn next_display_line(l: SelLine) -> SelLine {
+    match l.pane {
+        Pane::Left => SelLine { row: l.row, pane: Pane::Right },
+        Pane::Right => SelLine { row: l.row + 1, pane: Pane::Left },
+    }
+}
+
+/// Raw text of the selected lines: content verbatim (tabs kept), line numbers
+/// and terminators stripped, joined with `\n` in display order. Rows out of
+/// range (a stale selection right after the diff pair changed) are skipped —
+/// this never panics.
+pub fn selection_text(model: &DiffModel, sel: &DiffSelection) -> String {
+    let mut out = String::new();
+    for s in &sel.lines {
+        let pane = match s.pane {
+            Pane::Left => &model.left,
+            Pane::Right => &model.right,
+        };
+        let Some(line) = pane.get(s.row) else { continue };
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let t = line.text.strip_suffix('\n').unwrap_or(&line.text);
+        let t = t.strip_suffix('\r').unwrap_or(t);
+        out.push_str(t);
+    }
+    out
+}
+
+/// Renders the diff model into the center panel: two column headings +
+/// side-by-side rows. Also handles diff-row click selection and Ctrl+C
+/// (`egui::Event::Copy` — egui-winit turns the Ctrl+C / Ctrl+Insert chord into
+/// this event, so a `Key::C` press never fires): returns `Some(n)` when the raw
+/// text of the `n` selected lines was just copied to the clipboard (the caller
+/// shows the toast).
+pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut DiffSelection) -> Option<usize> {
     let total = model.left.len().max(model.right.len());
     let note = model
         .note
@@ -178,10 +317,10 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel) {
         });
     }
     if model.binary || total == 0 {
-        return;
+        return None;
     }
 
-    // Tính bề rộng cell: tối thiểu nửa chiều rộng có sẵn, dãn theo dòng dài nhất.
+    // Cell width: at least half the available width, stretched by the longest line.
     let font = diff_font();
     let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 4.0;
     let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0')).max(0.5);
@@ -190,7 +329,7 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel) {
     let content_w = GUTTER + 8.0 + model.max_chars as f32 * char_w;
     let cell_w = min_cell.max(content_w);
 
-    // Tiêu đề 2 cột (cùng cách chia bề rộng với phần nội dung tối thiểu).
+    // Two column headings (same width split as the minimum content layout).
     ui.horizontal(|ui| {
         let w = (ui.available_width() - 20.0) / 2.0;
         ui.add_sized(
@@ -206,7 +345,8 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel) {
     });
     ui.separator();
 
-    // MỘT ScrollArea duyệt index dòng → 2 cột trong cùng row ⇒ scroll đồng bộ tự nhiên.
+    // ONE ScrollArea walking row indexes → both columns in the same row ⇒
+    // scrolling stays in sync naturally.
     egui::ScrollArea::both()
         .id_salt("diff_scroll")
         .auto_shrink([false, false])
@@ -214,17 +354,63 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel) {
             for r in rows {
                 let l = model.left.get(r);
                 let rt = model.right.get(r);
+                let m = click_mods(ui);
                 ui.horizontal(|ui| {
-                    draw_cell(ui, cell_w, row_h, l);
-                    draw_cell(ui, cell_w, row_h, rt);
+                    let rl = draw_cell(ui, cell_w, row_h, l, sel.contains(Pane::Left, r));
+                    let rr = draw_cell(ui, cell_w, row_h, rt, sel.contains(Pane::Right, r));
+                    if rl.clicked() {
+                        // clicking a diff row gives up any lingering keyboard
+                        // focus (e.g. the file-search TextEdit) so the diff
+                        // view owns Ctrl+C from here on
+                        ui.memory_mut(|mem| {
+                            if let Some(f) = mem.focused() {
+                                mem.surrender_focus(f);
+                            }
+                        });
+                        apply_click(sel, SelLine { row: r, pane: Pane::Left }, m);
+                    }
+                    if rr.clicked() {
+                        ui.memory_mut(|mem| {
+                            if let Some(f) = mem.focused() {
+                                mem.surrender_focus(f);
+                            }
+                        });
+                        apply_click(sel, SelLine { row: r, pane: Pane::Right }, m);
+                    }
                 });
             }
         });
+
+    // Ctrl+C / Ctrl+Insert (the integration's "copy" command event): copy the
+    // raw text of the selected lines. Skipped while some other widget owns
+    // keyboard focus — a focused TextEdit handles Event::Copy itself (its
+    // cursor selection wins; nothing is stolen from the modal/search boxes).
+    if !sel.lines.is_empty()
+        && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
+        && ui.memory(|m| m.focused().is_none())
+    {
+        let text = selection_text(model, sel);
+        if !text.is_empty() {
+            let n = text.lines().count();
+            ui.ctx().copy_text(text);
+            return Some(n);
+        }
+    }
+    None
 }
 
-/// Vẽ một cell (nửa trái hoặc phải của một hàng diff).
-fn draw_cell(ui: &mut egui::Ui, w: f32, h: f32, line: Option<&Line>) {
-    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+/// Click modifiers of the current frame, read once per row.
+fn click_mods(ui: &egui::Ui) -> ClickMods {
+    ui.input(|i| ClickMods { ctrl: i.modifiers.ctrl, shift: i.modifiers.shift })
+}
+
+/// Draws one cell (the left or right half of a diff row). `selected` adds the
+/// selection highlight on top of the del/add tint; the returned response is
+/// used for click handling.
+fn draw_cell(ui: &mut egui::Ui, w: f32, h: f32, line: Option<&Line>, selected: bool) -> egui::Response {
+    // raw Sense::CLICK (not Sense::click()) — cells must NOT be focusable, or
+    // clicking one would steal keyboard focus and block the Ctrl+C handler.
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::CLICK);
     let bg = line.and_then(|l| {
         if l.del {
             Some(DEL_BG)
@@ -237,8 +423,15 @@ fn draw_cell(ui: &mut egui::Ui, w: f32, h: f32, line: Option<&Line>) {
     if let Some(bg) = bg {
         ui.painter().rect_filled(rect, 0.0, bg);
     }
+    if selected {
+        ui.painter().rect_filled(
+            rect,
+            0.0,
+            ui.visuals().selection.bg_fill.gamma_multiply(0.6),
+        );
+    }
     ui.painter().vline(rect.left(), rect.y_range(), SEP_STROKE);
-    let Some(l) = line else { return };
+    let Some(l) = line else { return resp };
     let p = ui.painter_at(rect);
     let y = rect.center().y;
     if let Some(no) = l.no {
@@ -250,7 +443,7 @@ fn draw_cell(ui: &mut egui::Ui, w: f32, h: f32, line: Option<&Line>) {
             NUM_COLOR,
         );
     }
-    // Bỏ terminator khi hiển thị; tab thay bằng 4 space (monospace).
+    // Strip the terminator for display; tabs become 4 spaces (monospace).
     let t = l.text.strip_suffix('\n').unwrap_or(&l.text);
     let t = t.strip_suffix('\r').unwrap_or(t);
     let t = t.replace('\t', "    ");
@@ -261,10 +454,11 @@ fn draw_cell(ui: &mut egui::Ui, w: f32, h: f32, line: Option<&Line>) {
         diff_font(),
         TEXT_COLOR,
     );
+    resp
 }
 
 // ---------------------------------------------------------------------------
-// Tests — dựng 2 cột từ hunks (logic thuần)
+// Tests — building the two columns from hunks (pure logic)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -306,7 +500,7 @@ mod tests {
 
     #[test]
     fn insert_head_and_tail() {
-        // Chèn đầu: old_lines == 0, old_start == 1 — trái có hàng đệm ở đầu
+        // head insert: old_lines == 0, old_start == 1 — left gets a leading filler row
         let base = lines(&["b\n", "c\n"]);
         let target = lines(&["a\n", "b\n", "c\n"]);
         let (l, r) = apply_hunks_to_sides(&base, &target, &[hunk(1, 0, 1, 1, "a\n")]);
@@ -317,11 +511,11 @@ mod tests {
         assert_eq!(l[1].no, Some(1));
         assert_eq!(r[1].no, Some(2));
 
-        // Chèn cuối: old_start == len + 1, dòng mới không kết newline
+        // tail insert: old_start == len + 1, new line has no trailing newline
         let base = lines(&["a\n"]);
         let target = lines(&["a\n", "b"]);
         let (l, r) = apply_hunks_to_sides(&base, &target, &[hunk(2, 0, 2, 1, "b")]);
-        assert_eq!(texts(&l), vec!["a\n", ""]); // bên trái có dòng đệm
+        assert_eq!(texts(&l), vec!["a\n", ""]); // left has a filler row
         assert_eq!(texts(&r), vec!["a\n", "b"]);
         assert!(r[1].add);
         assert_eq!(r[1].no, Some(2));
@@ -335,12 +529,12 @@ mod tests {
         let hunks = [hunk(2, 3, 2, 0, "")];
         let (l, r) = apply_hunks_to_sides(&base, &target, &hunks);
         assert_eq!(texts(&l), vec!["a\n", "x\n", "y\n", "z\n", "b\n"]);
-        assert_eq!(texts(&r), vec!["a\n", "", "", "", "b\n"]); // 3 hàng đệm bên phải
+        assert_eq!(texts(&r), vec!["a\n", "", "", "", "b\n"]); // 3 filler rows on the right
         for line in l.iter().take(4).skip(1) {
             assert!(line.del);
         }
         assert!(r[1].no.is_none());
-        assert_eq!(r[4].no, Some(2)); // "b\n" là dòng 2 của target
+        assert_eq!(r[4].no, Some(2)); // "b\n" is target line 2
     }
 
     #[test]
@@ -352,13 +546,13 @@ mod tests {
         assert_eq!(texts(&r), vec!["a\n", "B"]);
         assert!(l[1].del);
         assert!(r[1].add);
-        assert_eq!(l[1].text, "b"); // giữ nguyên terminator (ở đây không có)
+        assert_eq!(l[1].text, "b"); // terminator preserved (absent here)
     }
 
     #[test]
     fn two_regions_padded_rows() {
-        // Hai vùng sửa: vùng 2 có thêm 1 dòng mới ⇒ bên trái phải có dòng đệm
-        // để 2 pane thẳng hàng.
+        // Two change regions: the second adds one extra line ⇒ the left side
+        // needs a filler row to keep the panes row-aligned.
         let base = lines(&["1\n", "2\n", "3\n", "4\n", "5\n", "6\n", "7\n", "8\n", "9\n", "10\n"]);
         let target = lines(&["1\n", "hai\n", "3\n", "4\n", "5\n", "6\n", "7\n", "8\n", "9\n", "mười\n", "mười một\n"]);
         let hunks = [
@@ -366,8 +560,8 @@ mod tests {
             hunk(10, 1, 10, 2, "mười\nmười một\n"),
         ];
         let (l, r) = apply_hunks_to_sides(&base, &target, &hunks);
-        assert_eq!(l.len(), r.len(), "2 pane phải bằng hàng để scroll khớp");
-        // hàng đệm nằm ở cuối: trái None, phải là dòng mới thứ hai
+        assert_eq!(l.len(), r.len(), "both panes must have equal row counts for synced scrolling");
+        // the filler row is last: left None, right the second new line
         let last_l = l.last().unwrap();
         assert_eq!(last_l.no, None);
         assert_eq!(texts(&r)[r.len() - 1], "mười một\n");
@@ -400,5 +594,125 @@ mod tests {
         };
         m.compute_max_chars();
         assert_eq!(m.max_chars, 5);
+    }
+
+    // ----- selection → text (click rules + raw copy) -----
+
+    fn mods(ctrl: bool, shift: bool) -> ClickMods {
+        ClickMods { ctrl, shift }
+    }
+
+    /// 3-row model: left = ["a", "old", filler], right = ["a", "new", "extra"].
+    fn test_model() -> DiffModel {
+        DiffModel {
+            left_title: "left".into(),
+            right_title: "right".into(),
+            left: vec![Line::context("a\n", 1), Line::del("old\n", 2), Line::filler()],
+            right: vec![Line::context("a\n", 1), Line::add("new\n", 2), Line::add("extra\n", 3)],
+            binary: false,
+            note: None,
+            identical: false,
+            max_chars: 5,
+        }
+    }
+
+    #[test]
+    fn plain_click_selects_one_line_and_copy_is_raw() {
+        let m = test_model();
+        let mut sel = DiffSelection::default();
+        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Left }, mods(false, false));
+        assert_eq!(sel.lines.len(), 1);
+        assert_eq!(sel.anchor, Some(SelLine { row: 1, pane: Pane::Left }));
+        // raw text: no line number, no terminator, no decoration
+        assert_eq!(selection_text(&m, &sel), "old");
+        // a new plain click REPLACES the selection
+        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Right }, mods(false, false));
+        assert_eq!(selection_text(&m, &sel), "a");
+    }
+
+    #[test]
+    fn chaotic_ctrl_clicks_copy_in_display_order() {
+        let m = test_model();
+        let mut sel = DiffSelection::default();
+        // deliberately scrambled click order — the copy must still be in
+        // DISPLAY order (row-major, left before right at equal rows)
+        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Right }, mods(true, false));
+        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Left }, mods(true, false));
+        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Left }, mods(true, false));
+        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Right }, mods(true, false));
+        // ctrl+click toggles: select a filler row (empty text), then drop it
+        apply_click(&mut sel, SelLine { row: 2, pane: Pane::Left }, mods(true, false));
+        apply_click(&mut sel, SelLine { row: 2, pane: Pane::Left }, mods(true, false));
+        assert_eq!(selection_text(&m, &sel), "a\na\nold\nnew");
+    }
+
+    #[test]
+    fn empty_selection_copies_nothing() {
+        let m = test_model();
+        assert_eq!(selection_text(&m, &DiffSelection::default()), "");
+        // ctrl+clicking the only selected line empties the selection again
+        let mut sel = DiffSelection::default();
+        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Left }, mods(false, false));
+        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Left }, mods(true, false));
+        assert!(sel.lines.is_empty(), "ctrl+click must toggle the line off");
+        assert_eq!(selection_text(&m, &sel), "");
+    }
+
+    #[test]
+    fn two_panes_same_row_left_before_right() {
+        let m = test_model();
+        let mut sel = DiffSelection::default();
+        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Right }, mods(true, false));
+        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Left }, mods(true, false));
+        assert_eq!(selection_text(&m, &sel), "old\nnew");
+    }
+
+    #[test]
+    fn shift_click_selects_range_from_anchor() {
+        let m = test_model();
+        let mut sel = DiffSelection::default();
+        // shift+click with no anchor behaves like a plain click
+        apply_click(&mut sel, SelLine { row: 2, pane: Pane::Right }, mods(false, true));
+        assert_eq!(selection_text(&m, &sel), "extra");
+        // plain click sets the anchor
+        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Left }, mods(false, false));
+        // shift+click replaces the selection with the display-order range
+        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Right }, mods(false, true));
+        assert_eq!(selection_text(&m, &sel), "a\na\nold\nnew");
+        // the anchor stays put: extending further still starts at the same origin
+        apply_click(&mut sel, SelLine { row: 2, pane: Pane::Right }, mods(false, true));
+        // the range includes the left filler row (an empty copied line)
+        assert_eq!(selection_text(&m, &sel), "a\na\nold\nnew\n\nextra");
+    }
+
+    #[test]
+    fn out_of_range_rows_are_skipped_never_panic() {
+        let m = test_model(); // 3 rows per pane
+        let mut sel = DiffSelection::default();
+        // stale rows left over from an older, longer diff pair
+        apply_click(&mut sel, SelLine { row: 10, pane: Pane::Left }, mods(true, false));
+        apply_click(&mut sel, SelLine { row: 99, pane: Pane::Right }, mods(true, false));
+        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Left }, mods(true, false));
+        assert_eq!(selection_text(&m, &sel), "a");
+        // note-only model (empty panes) with the same selection — still no panic
+        let empty = DiffModel::empty_note("gone");
+        assert_eq!(selection_text(&empty, &sel), "");
+    }
+
+    #[test]
+    fn pair_change_resets_selection() {
+        // app::diff_panel resets to DiffSelection::default() when the diff key
+        // changes; the reset selection is empty against any model.
+        let m = test_model();
+        let mut sel = DiffSelection::default();
+        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Left }, mods(false, false));
+        assert_eq!(selection_text(&m, &sel), "old");
+        let sel = DiffSelection::default(); // the reset applied by app on a stale key
+        let shorter = DiffModel {
+            left: vec![Line::context("x\n", 1)],
+            right: vec![Line::context("y\n", 1)],
+            ..m
+        };
+        assert_eq!(selection_text(&shorter, &sel), "");
     }
 }

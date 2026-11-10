@@ -1,15 +1,16 @@
-//! patch — structured patch: định dạng delta lưu trên disk (mảng hunks JSON, nén zstd ở tầng blob).
+//! Structured patch — the on-disk delta format (a JSON array of hunks, zstd-compressed at
+//! the blob layer).
 //!
-//! Ngữ nghĩa splice xem `model::Hunk`: toạ độ hunk tính trên dòng GỐC của base; các hunk tăng
-//! dần `old_start`, không chồng nhau; apply = duyệt tuần tự và nối bytes (không parse lại
-//! line ending).
+//! Splice semantics: see `model::Hunk`. Hunk coordinates refer to the original base lines;
+//! hunks are ordered by `old_start` and never overlap. Apply is a sequential scan that
+//! concatenates bytes — line endings are never re-parsed.
 
 use similar::{ChangeTag, DiffOp, TextDiff};
 
 use crate::model::{Error, Hunk, Result};
 
-/// Chia bytes thành các dòng: cắt sau mỗi `\n`, terminator giữ nguyên trong dòng
-/// (dòng `abc\r\n` nguyên vẹn). Input rỗng → vec rỗng; dòng cuối không có `\n` vẫn là 1 dòng.
+/// Splits bytes into lines: cut after each `\n`, keeping the terminator in the line
+/// (`abc\r\n` stays intact). Empty input → empty vec; a final line without `\n` still counts.
 pub(crate) fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -25,7 +26,7 @@ pub(crate) fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
     out
 }
 
-/// Khoảng dòng (start, end — nửa mở) mà một op chiếm trên chuỗi old.
+/// Half-open line span `(start, end)` an op occupies on the old side.
 fn op_old_span(op: &DiffOp) -> (usize, usize) {
     match *op {
         DiffOp::Equal { old_index, len, .. } => (old_index, old_index + len),
@@ -35,7 +36,7 @@ fn op_old_span(op: &DiffOp) -> (usize, usize) {
     }
 }
 
-/// Khoảng dòng mà một op chiếm trên chuỗi new.
+/// Half-open line span `(start, end)` an op occupies on the new side.
 fn op_new_span(op: &DiffOp) -> (usize, usize) {
     match *op {
         DiffOp::Equal { new_index, len, .. } => (new_index, new_index + len),
@@ -45,11 +46,12 @@ fn op_new_span(op: &DiffOp) -> (usize, usize) {
     }
 }
 
-/// Sinh hunks từ hai nội dung text (caller — record — đã xác nhận UTF-8).
+/// Builds hunks from two text contents (the caller — record — has already validated UTF-8).
 ///
-/// Dùng `similar::TextDiff::from_lines` + `grouped_ops(3)` (context 3): mỗi nhóm op → một hunk,
-/// toạ độ tính trên dòng gốc của `old`. `new_text` lấy từ chính tokenization của similar
-/// (dòng giữ terminator) nên luôn tự nhất quán với toạ độ op.
+/// Uses `similar::TextDiff::from_lines` + `grouped_ops(3)` (context 3): each group of ops
+/// becomes one hunk, with coordinates referring to the original lines of `old`. `new_text`
+/// comes from similar's own tokenization (lines keep terminators), so it is always
+/// self-consistent with the op coordinates.
 pub(crate) fn make_patch(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>> {
     let old_str = std::str::from_utf8(old)
         .map_err(|_| Error::CorruptChain("make_patch: nội dung cũ không phải UTF-8".into()))?;
@@ -58,8 +60,8 @@ pub(crate) fn make_patch(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>> {
 
     let diff = TextDiff::from_lines(old_str, new_str);
 
-    // Dòng phía "new" theo đúng tokenization của similar: mọi change không phải Delete
-    // đều là một dòng của chuỗi mới, theo đúng thứ tự.
+    // New-side lines in order: every non-Delete change is one line of the new content,
+    // using similar's own tokenization.
     let new_side: Vec<&str> = diff
         .iter_all_changes()
         .filter(|c| c.tag() != ChangeTag::Delete)
@@ -93,15 +95,16 @@ pub(crate) fn make_patch(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>> {
     Ok(hunks)
 }
 
-/// Áp tuần tự các hunks lên `base`. Hunks phải tăng dần `old_start`, không chồng nhau và
-/// vùng old phải nằm trong base — vi phạm → `Error::CorruptChain`.
+/// Applies hunks sequentially to `base`. Hunks must be ordered by `old_start`, must not
+/// overlap, and their old regions must lie within base — otherwise `Error::CorruptChain`.
 ///
-/// Vì toạ độ hunk tính trên dòng gốc của base (và các hunk rời rạc), áp tuần tự với một con
-/// trỏ "dòng đã sao chép" cho kết quả đúng như splice từng hunk.
+/// Because hunk coordinates refer to the original base lines (and hunks are disjoint),
+/// a sequential scan with a "lines copied so far" cursor reproduces the per-hunk splice
+/// exactly.
 pub(crate) fn apply_patch(base: &[u8], hunks: &[Hunk]) -> Result<Vec<u8>> {
     let lines = split_lines(base);
     let mut out = Vec::with_capacity(base.len());
-    let mut next_old: usize = 0; // dòng base đầu tiên chưa được sao chép
+    let mut next_old: usize = 0; // first base line not yet copied
     let mut prev_start: u64 = 0;
     for (idx, h) in hunks.iter().enumerate() {
         if h.old_start <= prev_start {
@@ -133,12 +136,12 @@ pub(crate) fn apply_patch(base: &[u8], hunks: &[Hunk]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Serialize hunks → JSON bytes (bước trước khi nén zstd vào blob delta).
+/// Serializes hunks to JSON (the step before zstd-compression into a delta blob).
 pub(crate) fn encode_hunks(hunks: &[Hunk]) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(hunks)?)
 }
 
-/// Đọc lại hunks từ JSON bytes.
+/// Parses hunks back from JSON bytes.
 pub(crate) fn decode_hunks(bytes: &[u8]) -> Result<Vec<Hunk>> {
     Ok(serde_json::from_slice(bytes)?)
 }
@@ -147,8 +150,8 @@ pub(crate) fn decode_hunks(bytes: &[u8]) -> Result<Vec<Hunk>> {
 mod tests {
     use super::*;
 
-    /// Roundtrip bắt buộc: make_patch → JSON (đúng đường serialize trên disk) → decode
-    /// → apply_patch phải ra đúng nội dung mới, byte-exact.
+    /// Mandatory roundtrip: make_patch → JSON (the exact on-disk serialization path) →
+    /// decode → apply_patch must reproduce the new content byte-exactly.
     fn roundtrip(old: &str, new: &str) {
         let hunks = make_patch(old.as_bytes(), new.as_bytes()).unwrap();
         let json = encode_hunks(&hunks).unwrap();
@@ -167,7 +170,7 @@ mod tests {
             split_lines(b"a\nb\nc"),
             vec![&b"a\n"[..], &b"b\n"[..], &b"c"[..]]
         );
-        // CRLF giữ nguyên terminator trong dòng
+        // CRLF terminators stay intact in the line
         assert_eq!(split_lines(b"a\r\nb\r\n"), vec![&b"a\r\n"[..], &b"b\r\n"[..]]);
     }
 
@@ -215,8 +218,8 @@ mod tests {
 
     #[test]
     fn roundtrip_two_regions_and_identity() {
-        // Hai vùng sửa cách nhau hơn 6 dòng (2 * context) → phải ra ≥ 2 hunks riêng,
-        // toạ độ theo dòng gốc vẫn apply đúng.
+        // Two edited regions more than 6 lines apart (2 * context) must yield >= 2 separate
+        // hunks; original-line coordinates still apply correctly.
         let old: String = (1..=12).map(|i| format!("line {i}\n")).collect();
         let mut lines: Vec<String> = (1..=12).map(|i| format!("line {i}\n")).collect();
         lines[1] = "edited-2\n".to_string();
@@ -225,19 +228,19 @@ mod tests {
         let hunks = make_patch(old.as_bytes(), new.as_bytes()).unwrap();
         assert!(hunks.len() >= 2, "hai vùng xa nhau phải ra >= 2 hunks (got {})", hunks.len());
         roundtrip(&old, &new);
-        // Nội dung giống hệt nhau → không hunk nào
+        // Identical content → no hunks
         assert!(make_patch(old.as_bytes(), old.as_bytes()).unwrap().is_empty());
     }
 
     #[test]
     fn apply_rejects_corrupt_hunks() {
-        // old_start không tăng dần
+        // old_start not increasing
         let bad_order = vec![
             Hunk { old_start: 2, old_lines: 1, new_start: 2, new_lines: 1, new_text: "x\n".into() },
             Hunk { old_start: 2, old_lines: 1, new_start: 3, new_lines: 1, new_text: "y\n".into() },
         ];
         assert!(apply_patch(b"1\n2\n3\n", &bad_order).is_err());
-        // old_start vượt số dòng của base
+        // old_start beyond the base line count
         let over = vec![Hunk {
             old_start: 9,
             old_lines: 1,
@@ -246,7 +249,7 @@ mod tests {
             new_text: "x\n".into(),
         }];
         assert!(apply_patch(b"1\n2\n3\n", &over).is_err());
-        // Hai hunk chồng vùng old
+        // two hunks whose old regions overlap
         let overlap = vec![
             Hunk { old_start: 1, old_lines: 2, new_start: 1, new_lines: 1, new_text: "x\n".into() },
             Hunk { old_start: 2, old_lines: 1, new_start: 3, new_lines: 1, new_text: "y\n".into() },

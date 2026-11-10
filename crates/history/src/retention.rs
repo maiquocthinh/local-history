@@ -1,9 +1,11 @@
-//! Retention / GC — dọn version cũ theo chính sách "ngày làm việc" (kiểu JetBrains) và
-//! sweep blob mồ côi (blob trên disk không còn row nào trỏ tới — do crash giữa record).
+//! Retention / GC — prunes old versions under the "working days" policy (JetBrains-style)
+//! and sweeps orphan blobs (blobs on disk that no row references anymore, e.g. after a
+//! crash mid-record).
 //!
-//! Luồng: `gc_scan()` group version theo file → `deletion_plan()` tính run xóa cho từng file
-//! (prefix cũ hơn cutoff, ngoài `min_versions` mới nhất, cascade qua delta khi xóa full) →
-//! `delete_versions()` xóa row trong transaction → xóa blob file tương ứng → sweep mồ côi.
+//! Flow: `gc_scan()` groups versions per file → `deletion_plan()` computes the deletion run
+//! per file (prefix older than the cutoff, outside the newest `min_versions`, cascading
+//! through deltas when a full is deleted) → `delete_versions()` removes the rows in one
+//! transaction → the matching blob files are removed → orphan sweep.
 
 use std::collections::HashSet;
 use std::io::ErrorKind;
@@ -13,16 +15,16 @@ use time::{OffsetDateTime, Time, Weekday};
 use crate::model::{GcFile, GcReport, Result, RetentionPolicy, Storage, VersionId, WorkspaceId};
 use crate::store::{now_micros, LocalHistory};
 
-/// Tính cutoff (unix micros UTC): lùi `working_days` ngày LÀM VIỆC (Mon–Fri) từ ngày của
-/// `now`, bỏ qua Thứ 7/Chủ nhật; cutoff = 00:00 UTC của ngày làm việc thứ N lùi lại.
+/// Computes the cutoff (unix micros UTC): steps back `working_days` working days (Mon–Fri)
+/// from `now`'s date, skipping Saturday/Sunday; the cutoff is 00:00 UTC of that day.
 ///
-/// `working_days == 0` → 00:00 UTC của chính ngày `now` (kể cả khi `now` rơi vào cuối tuần).
-/// TODO(semantics): `0` ngày + `now` là cuối tuần chưa có định nghĩa chặt trong spec —
-/// chọn cách đơn giản nhất như trên.
+/// `working_days == 0` → 00:00 UTC of `now`'s own day (even if `now` falls on a weekend).
+/// TODO(semantics): `0` days + a weekend `now` is not pinned down in the spec — the
+/// simplest choice above was taken.
 pub(crate) fn working_day_cutoff(now_micros: i64, working_days: u32) -> i64 {
     let now = OffsetDateTime::from_unix_timestamp_nanos(now_micros as i128 * 1000)
         .expect("unix micros nằm ngoài khoảng time crate biểu diễn được");
-    let mut day = now.date(); // ngày UTC của now
+    let mut day = now.date();
     let mut remaining = working_days;
     while remaining > 0 {
         day = day
@@ -35,44 +37,49 @@ pub(crate) fn working_day_cutoff(now_micros: i64, working_days: u32) -> i64 {
     day.with_time(Time::MIDNIGHT).assume_utc().unix_timestamp() * 1_000_000
 }
 
-/// THUẦN TÚNG (không đụng db/disk) — kế hoạch xóa cho 1 file: trả về các VersionId cần xóa,
-/// theo thứ tự seq tăng dần.
+/// PURE (no db/disk access) — the deletion plan for one file: the VersionIds to delete,
+/// in ascending seq order.
 ///
-/// - Candidate = prefix của `versions` (seq tăng dần) có `timestamp_micros < cutoff` VÀ nằm
-///   ngoài `min_versions` version mới nhất (index < versions.len() - min_versions).
-/// - CASCADE: sau khi chọn run, kéo dài run qua các version kế tiếp nếu nó là Delta (mất base
-///   full thì chain sau không tái tạo được); dừng khi chạm vùng được bảo vệ
-///   (`run.len() < versions.len() - min_versions`) hoặc gặp Full.
+/// - Candidates: the prefix of `versions` (ascending seq) with `timestamp_micros < cutoff`
+///   that also lies outside the newest `min_versions` versions
+///   (index < versions.len() - min_versions).
+/// - CASCADE: after the run is picked, it is extended over the following versions while
+///   they are deltas (losing a base full makes the rest of the chain unreconstructable);
+///   it stops at the protected zone (`run.len() < versions.len() - min_versions`) or at
+///   a full.
 ///
-/// Biên đã chấp nhận theo đặc tả: một Delta nằm TRONG vùng bảo vệ có thể mất base (bị xóa)
-/// khi `min_versions` nhỏ — row còn nhưng reconstruct sẽ lỗi chain; GC không tự sửa.
+/// Accepted edge per spec: a delta inside the protected zone can lose its base (deleted)
+/// when `min_versions` is small — the row survives but reconstruction fails; GC does not
+/// repair this.
 pub(crate) fn deletion_plan(
     gc_file: &GcFile,
     cutoff_micros: i64,
     min_versions: u32,
 ) -> Vec<VersionId> {
     let versions = &gc_file.versions;
-    // Vùng bảo vệ: min_versions version mới nhất (index >= boundary).
-    // len < min_versions → boundary = 0 → không xóa gì.
+    // Protected zone: the newest min_versions versions (index >= boundary).
+    // len < min_versions → boundary = 0 → nothing is deleted.
     let boundary = versions.len().saturating_sub(min_versions as usize);
 
     let mut run: Vec<VersionId> = Vec::new();
-    // 1) prefix ứng viên: cũ hơn cutoff và ngoài vùng bảo vệ — dừng ở version đầu không thỏa.
+    // 1) Candidate prefix: older than the cutoff and outside the protected zone — stop at
+    // the first version that fails.
     for v in versions.iter().take(boundary) {
         if v.timestamp_micros >= cutoff_micros {
             break;
         }
         run.push(v.id);
     }
-    // 2) cascade: kéo dài qua Delta kế tiếp; Full hoặc vùng bảo vệ chặn run.
+    // 2) Cascade: extend over following deltas; a full or the protected zone ends the run.
     while run.len() < boundary && versions[run.len()].storage != Storage::Full {
         run.push(versions[run.len()].id);
     }
     run
 }
 
-/// Parse tên file blob `v<id>-full.zst` / `v<id>-delta.zst` → version id.
-/// Tên khác (tên lạ, thư mục...) → None — GC không đụng vào những gì nó không hiểu.
+/// Parses a blob file name `v<id>-full.zst` / `v<id>-delta.zst` → version id.
+/// Anything else (odd names, directories...) → None — GC never touches what it does not
+/// recognize.
 fn parse_blob_file_name(name: &str) -> Option<VersionId> {
     let rest = name.strip_prefix('v')?;
     let (id, tail) = rest.split_once('-')?;
@@ -83,9 +90,9 @@ fn parse_blob_file_name(name: &str) -> Option<VersionId> {
 }
 
 impl LocalHistory {
-    /// GC đầy đủ. `ws` = None → quét mọi workspace. `dry_run` = chỉ đếm, không xóa db/blob.
-    /// Cuối cùng luôn chạy orphan sweep (không lọc theo `ws` — blob mồ côi không thuộc row
-    /// nào nên phải quét hết mọi thư mục workspace).
+    /// Full GC. `ws = None` scans every workspace. `dry_run` only counts, touching neither
+    /// db nor blobs. The orphan sweep always runs at the end (not filtered by `ws` — an
+    /// orphan blob belongs to no row, so every workspace directory must be scanned).
     pub fn gc(
         &self,
         ws: Option<WorkspaceId>,
@@ -98,7 +105,7 @@ impl LocalHistory {
 
         let mut report = GcReport { dry_run, ..GcReport::default() };
         let mut ids: Vec<VersionId> = Vec::new();
-        // (version_id, ws, storage) — cho dry_run tính dung lượng blob sẽ giải phóng
+        // (version_id, ws, storage) — lets dry_run compute the blob bytes that would be freed
         let mut planned: Vec<(VersionId, WorkspaceId, Storage)> = Vec::new();
 
         for gf in &scan {
@@ -123,7 +130,8 @@ impl LocalHistory {
         report.versions_deleted = ids.len() as u64;
 
         if dry_run {
-            // Không đụng db/disk: bytes_freed = dung lượng blob sẽ giải phóng (metadata nếu có).
+            // No db/disk writes: bytes_freed = size of the blobs that would be freed
+            // (from metadata, when available).
             for (vid, w, storage) in &planned {
                 let path = self.blob_path(*w, *vid, *storage);
                 if let Ok(meta) = std::fs::metadata(&path) {
@@ -131,12 +139,12 @@ impl LocalHistory {
                 }
             }
         } else if !ids.is_empty() {
-            // Xóa row trong một transaction, rồi mới dọn blob trên disk.
+            // Delete the rows in one transaction, then remove the blobs from disk.
             let blobs = self.delete_versions(&ids)?;
             report.versions_deleted = blobs.len() as u64;
             for blob in &blobs {
                 let path = self.blob_path(blob.ws_id, blob.version_id, blob.storage);
-                // dung lượng file TRƯỚC khi xóa; file đã biến mất → bỏ qua
+                // file size before removal; a vanished file contributes nothing
                 let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 match std::fs::remove_file(&path) {
                     Ok(()) => report.bytes_freed += len,
@@ -150,27 +158,28 @@ impl LocalHistory {
         Ok(report)
     }
 
-    /// Tiện ích: gc với now = hiện tại, dry_run = false.
+    /// Convenience: gc with the current time and dry_run = false.
     pub fn gc_auto(&self, ws: Option<WorkspaceId>, policy: &RetentionPolicy) -> Result<GcReport> {
         self.gc(ws, policy, now_micros(), false)
     }
 
-    /// Duyệt `workspaces_dir()` → mỗi thư mục ws con → `blobs/`: file `v<id>-*.zst` mà id
-    /// không còn trong db, hoặc file `.tmp` rác (record bị crash giữa chừng) → mồ côi.
-    /// `dry_run` chỉ đếm; ngược lại xóa file (bỏ qua NotFound) và cộng bytes vào `bytes_freed`.
+    /// Walks `workspaces_dir()` → each workspace dir → `blobs/`: a `v<id>-*.zst` file whose
+    /// id is no longer in the db, or a stray `.tmp` file (record crashed midway), is an
+    /// orphan. `dry_run` only counts; otherwise the file is removed (NotFound ignored) and
+    /// its bytes added to `bytes_freed`.
     ///
-    /// TODO(concurrency): `.tmp` đang được record process khác ghi trong tích tắc cũng bị
-    /// tính là mồ côi — chấp nhận được vì daemon GC chạy lúc start/mỗi 6h, record thất bại
-    /// sẽ rollback và ghi lại.
+    /// TODO(concurrency): a `.tmp` another record is writing at that very moment is also
+    /// counted as an orphan — acceptable because the daemon runs GC at startup/every 6h,
+    /// and a failed record rolls back and is retried.
     fn sweep_orphans(&self, dry_run: bool, bytes_freed: &mut u64) -> Result<u64> {
         let known = self.known_version_ids()?;
         let mut orphans = 0u64;
         let Ok(ws_entries) = std::fs::read_dir(self.workspaces_dir()) else {
-            return Ok(0); // chưa có thư mục workspaces — không có gì để dọn
+            return Ok(0); // no workspaces dir yet — nothing to clean
         };
         for ws_dir in ws_entries.flatten() {
             let Ok(blob_entries) = std::fs::read_dir(ws_dir.path().join("blobs")) else {
-                continue; // ws chưa ghi blob lần nào
+                continue; // workspace has never written a blob
             };
             for entry in blob_entries.flatten() {
                 let path = entry.path();
@@ -214,7 +223,7 @@ mod tests {
 
     const HOUR: i64 = 3_600_000_000;
 
-    /// unix micros UTC của ngày-giờ cụ thể — dùng làm mốc assert cứng.
+    /// unix micros UTC of a specific date-time — used as a hard assert anchor.
     fn micros_at(y: i32, m: Month, d: u8, h: u8, mi: u8) -> i64 {
         time::Date::from_calendar_date(y, m, d)
             .unwrap()
@@ -227,7 +236,7 @@ mod tests {
         crate::model::Version {
             id,
             file_id: 1,
-            seq: id, // cho gọn: seq trùng id
+            seq: id, // shorthand: seq equals id
             timestamp_micros: ts_micros,
             kind: EventKind::External,
             label: None,
@@ -250,13 +259,13 @@ mod tests {
 
     #[test]
     fn cutoff_friday_steps_back_working_days() {
-        // khóa mốc theo lịch thật: 2026-11-06 là Thứ 6
+        // anchored to the real calendar: 2026-11-06 is a Friday
         let fri = time::Date::from_calendar_date(2026, Month::November, 6).unwrap();
         assert_eq!(fri.weekday(), Weekday::Friday);
         let now = micros_at(2026, Month::November, 6, 15, 0);
-        // lùi 1 ngày làm việc → Thứ 5 00:00 UTC
+        // back 1 working day → Thursday 00:00 UTC
         assert_eq!(working_day_cutoff(now, 1), micros_at(2026, Month::November, 5, 0, 0));
-        // lùi 3 → Thứ 3 00:00 UTC (không băng qua cuối tuần)
+        // back 3 → Tuesday 00:00 UTC (does not cross the weekend)
         let tue = time::Date::from_calendar_date(2026, Month::November, 3).unwrap();
         assert_eq!(tue.weekday(), Weekday::Tuesday);
         assert_eq!(working_day_cutoff(now, 3), micros_at(2026, Month::November, 3, 0, 0));
@@ -264,11 +273,11 @@ mod tests {
 
     #[test]
     fn cutoff_skips_weekend() {
-        // Thứ 2 2026-11-09 10:00 UTC lùi 1 ngày làm việc → Thứ 6 2026-11-06 00:00
-        // (bỏ qua CN 11-08 và T7 11-07)
+        // Monday 2026-11-09 10:00 UTC, back 1 working day → Friday 2026-11-06 00:00
+        // (skips Sun 11-08 and Sat 11-07)
         let monday = micros_at(2026, Month::November, 9, 10, 0);
         assert_eq!(working_day_cutoff(monday, 1), micros_at(2026, Month::November, 6, 0, 0));
-        // Thứ 6 lùi 5 ngày làm việc → Thứ 6 tuần trước 00:00 (2026-10-30)
+        // Friday back 5 working days → the previous Friday 00:00 (2026-10-30)
         let friday = micros_at(2026, Month::November, 6, 9, 30);
         assert_eq!(working_day_cutoff(friday, 5), micros_at(2026, Month::October, 30, 0, 0));
     }
@@ -291,7 +300,7 @@ mod tests {
 
     #[test]
     fn plan_picks_old_prefix_outside_min_versions() {
-        // 60 version cách nhau 2h; version index < 40 cũ hơn cutoff; min_versions = 10
+        // 60 versions 2h apart; index < 40 is older than the cutoff; min_versions = 10
         let cutoff = 1_000_000_000_000_000;
         let rows: Vec<_> = (0..60i64)
             .map(|i| {
@@ -301,14 +310,15 @@ mod tests {
             })
             .collect();
         let gf = gc_file(&rows);
-        // prefix đúng 40 version đầu (v40 trúng đúng cutoff → không tính), cascade dừng ngay
-        // vì v40 là Full
+        // exactly the first 40 (v40 hits the cutoff exactly → not a candidate); the cascade
+        // stops immediately because v40 is full
         assert_eq!(deletion_plan(&gf, cutoff, 10), (1..=40).collect::<Vec<_>>());
     }
 
     #[test]
     fn plan_cascades_through_deltas_until_full() {
-        // survivor đầu (index 40) là Delta → cascade kéo run qua 40..44, dừng ở Full index 45
+        // the first survivor (index 40) is a delta → the cascade extends the run over
+        // 40..44 and stops at the full at index 45
         let cutoff = 1_000_000_000_000_000;
         let rows: Vec<_> = (0..60i64)
             .map(|i| {
@@ -323,7 +333,8 @@ mod tests {
 
     #[test]
     fn plan_respects_min_versions_floor() {
-        // chỉ 30 version < min_versions=50 → không xóa gì dù mọi version đều cũ
+        // only 30 versions < min_versions = 50 → nothing is deleted even though every
+        // version is old
         let cutoff = 1_000_000_000_000_000;
         let rows: Vec<_> = (0..30i64)
             .map(|i| (i + 1, cutoff - 100 * HOUR + i * HOUR, Storage::Full))
@@ -334,7 +345,7 @@ mod tests {
 
     #[test]
     fn plan_never_crosses_protected_zone() {
-        // 60 version đều cũ hơn cutoff → xóa đúng 50 (giữ nguyên 10 mới nhất)
+        // 60 versions all older than the cutoff → exactly 50 deleted (the newest 10 kept)
         let cutoff = 1_000_000_000_000_000;
         let rows: Vec<_> = (0..60i64)
             .map(|i| {
@@ -346,14 +357,14 @@ mod tests {
         assert_eq!(deletion_plan(&gf, cutoff, 10).len(), 50);
     }
 
-    // ----- parse tên blob -----
+    // ----- blob name parsing -----
 
     #[test]
     fn parse_blob_names() {
         assert_eq!(parse_blob_file_name("v12-full.zst"), Some(12));
         assert_eq!(parse_blob_file_name("v345-delta.zst"), Some(345));
         assert_eq!(parse_blob_file_name("v99999-full.zst"), Some(99999));
-        assert_eq!(parse_blob_file_name("v12-full.zst.tmp"), None); // rơi vào nhánh .tmp
+        assert_eq!(parse_blob_file_name("v12-full.zst.tmp"), None); // handled by the .tmp branch of the sweep
         assert_eq!(parse_blob_file_name("x.tmp"), None);
         assert_eq!(parse_blob_file_name("v1-2-full.zst"), None);
         assert_eq!(parse_blob_file_name("vabc-full.zst"), None);

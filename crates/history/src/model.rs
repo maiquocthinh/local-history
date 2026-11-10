@@ -1,14 +1,15 @@
-//! Kiểu dữ liệu dùng chung của engine local-history.
-//! Đây là hợp đồng: mọi module (record, reconstruct, retention, daemon, cli, gui) đều dùng các
-//! kiểu này — không tự định nghĩa lại.
+//! Shared data types of the local-history engine.
+//! This is the contract: every consumer (record, reconstruct, retention, daemon, cli, gui)
+//! uses these types instead of defining its own.
 
 use serde::{Deserialize, Serialize};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Kích thước file tối đa được record — lớn hơn thì bỏ qua (tránh phình storage).
+/// Largest file size that gets recorded; larger files are skipped to avoid bloating storage.
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
+/// Errors returned by the engine.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("sqlite: {0}")]
@@ -33,25 +34,27 @@ pub enum Error {
     BadStorage(String),
 }
 
+/// What triggered a version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
-    /// Editor chủ động save (phase 2 hook trong Wu)
+    /// Editor-initiated save (phase 2 hook in Wu).
     Save,
-    /// Thay đổi ngoài editor — watcher daemon ghi
+    /// Change made outside the editor — recorded by the watcher daemon.
     External,
-    /// File bị xóa (marker; nội dung cũ vẫn còn trong chain)
+    /// File was deleted (marker; the previous content stays in the chain).
     Delete,
-    /// File được khôi phục nội dung (sau revert/restore)
+    /// Content was restored (after a revert/restore).
     Restore,
-    /// Snapshot an toàn TRƯỚC khi revert ghi đè
+    /// Safety snapshot taken before a revert overwrites the current content.
     PreRevert,
-    /// Đổi tên (phase 1: ghi 2 event delete+create riêng)
+    /// Rename (phase 1 records separate delete + create events).
     Rename,
-    /// Label ngữ nghĩa ("trước khi chạy test", "trước khi commit"...)
+    /// Semantic marker ("before running tests", "before commit", ...).
     Label,
 }
 
 impl EventKind {
+    /// Canonical string form, as stored in the db and exchanged over IPC.
     pub fn as_str(self) -> &'static str {
         match self {
             EventKind::Save => "save",
@@ -64,6 +67,7 @@ impl EventKind {
         }
     }
 
+    /// Parses the canonical string form; unknown values yield `Error::BadKind`.
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "save" => Ok(EventKind::Save),
@@ -78,6 +82,8 @@ impl EventKind {
     }
 }
 
+/// How a version's content is stored: a complete snapshot or a delta against the previous
+/// version in the chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Storage {
     Full,
@@ -85,6 +91,7 @@ pub enum Storage {
 }
 
 impl Storage {
+    /// Canonical string form, as stored in the db.
     pub fn as_str(self) -> &'static str {
         match self {
             Storage::Full => "full",
@@ -92,6 +99,7 @@ impl Storage {
         }
     }
 
+    /// Parses the canonical string form; unknown values yield `Error::BadStorage`.
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "full" => Ok(Storage::Full),
@@ -101,30 +109,34 @@ impl Storage {
     }
 }
 
+/// Primary key of a `workspaces` row.
 pub type WorkspaceId = i64;
+/// Primary key of a `files` row.
 pub type FileId = i64;
+/// Primary key of a `versions` row.
 pub type VersionId = i64;
 
-/// Một version trong timeline.
+/// One version in a file's timeline.
 #[derive(Debug, Clone)]
 pub struct Version {
     pub id: VersionId,
     pub file_id: FileId,
+    /// Per-file sequence number, 1-based and consecutive within a chain.
     pub seq: i64,
-    /// unix micros UTC
+    /// UTC unix timestamp in microseconds.
     pub timestamp_micros: i64,
     pub kind: EventKind,
     pub label: Option<String>,
     pub storage: Storage,
-    /// Với delta: seq của version ngay trước nó trong chain. Full: None.
+    /// For deltas: seq of the immediate predecessor in the chain. `None` for fulls.
     pub base_seq: Option<i64>,
-    /// Kích thước nội dung sau khi tái tạo (bytes)
+    /// Size of the reconstructed content, in bytes.
     pub size: u64,
-    /// blake3 hex
+    /// blake3 hash of the reconstructed content, hex-encoded.
     pub content_hash: String,
 }
 
-/// Tóm tắt một file có lịch sử (cho list file trong CLI/GUI).
+/// Summary of a file that has history, for file listings in the CLI/GUI.
 #[derive(Debug, Clone)]
 pub struct FileSummary {
     pub file_id: FileId,
@@ -136,25 +148,26 @@ pub struct FileSummary {
     pub last_kind: EventKind,
 }
 
-/// Một hunk của structured patch — định dạng delta lưu trên disk (JSON + zstd).
+/// One hunk of a structured patch — the on-disk delta format (JSON, zstd-compressed at the
+/// blob layer).
 ///
-/// Ngữ nghĩa splice (bắt buộc dùng đúng cho apply):
-/// dòng được chia sau mỗi `\n`, terminator giữ nguyên trong dòng; dòng cuối có thể không có
-/// terminator. Với danh sách dòng `lines` (0-based) của base:
-///   kết quả = lines[0..old_start-1] ++ split_lines(new_text) ++ lines[old_start-1+old_lines..]
-/// Khi old_lines == 0 (insert thuần), old_start-1 = số dòng trước điểm chèn
-/// (old_start = 1 → chèn đầu file; old_start = len+1 → chèn cuối file).
+/// Splice semantics (apply depends on this): lines are split after each `\n` and the
+/// terminator stays part of the line; the last line may lack a terminator. With `lines`
+/// (0-based) the lines of the base content:
+///   result = lines[0..old_start-1] ++ split_lines(new_text) ++ lines[old_start-1+old_lines..]
+/// When `old_lines == 0` (pure insert), `old_start - 1` is the number of lines before the
+/// insertion point (`old_start = 1` inserts at the top; `old_start = len + 1` appends).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Hunk {
     pub old_start: u64,
     pub old_lines: u64,
     pub new_start: u64,
     pub new_lines: u64,
-    /// Nội dung dòng mới nguyên bản (gồm terminator), nối liền nhau
+    /// Verbatim new lines including terminators, concatenated.
     pub new_text: String,
 }
 
-/// Chính sách GC. Mặc định kiểu JetBrains: ~5 ngày làm việc, tối thiểu 50 version/file.
+/// GC policy. JetBrains-style default: about 5 working days, at least 50 versions per file.
 #[derive(Debug, Clone, Copy)]
 pub struct RetentionPolicy {
     pub working_days: u32,
@@ -167,7 +180,7 @@ impl Default for RetentionPolicy {
     }
 }
 
-/// Kết quả một lần chạy GC.
+/// Result of one GC run.
 #[derive(Debug, Clone, Default)]
 pub struct GcReport {
     pub files_scanned: u64,
@@ -177,7 +190,7 @@ pub struct GcReport {
     pub dry_run: bool,
 }
 
-/// Dữ liệu đầu vào cho GC: mọi version của một file, sắp theo seq tăng dần.
+/// GC input: all versions of one file, ordered by ascending seq.
 #[derive(Debug, Clone)]
 pub struct GcFile {
     pub ws_id: WorkspaceId,

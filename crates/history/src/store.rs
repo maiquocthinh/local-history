@@ -1,13 +1,15 @@
-//! Store — mở index SQLite, migration schema, đăng ký workspace, query dùng chung.
+//! Store — opens the SQLite index, migrates the schema, registers workspaces, and hosts
+//! the queries shared by the other modules.
 //!
-//! Quy ước storage (xem docs/architecture.md):
-//! - root/index.db            — SQLite WAL
+//! Storage layout (see docs/architecture.md):
+//! - root/index.db            — SQLite, WAL mode
 //! - root/workspaces/<ws_id>/blobs/v<version_id>-full.zst | v<version_id>-delta.zst
-//! - ws_id = 8 bytes đầu của blake3(canonical root), format 16 hex khi làm tên thư mục
+//! - ws_id = first 8 bytes of blake3(canonical root), formatted as 16 hex chars for the
+//!   directory name
 //!
-//! Ghi version (record) BẮT BUỘC chạy trong một transaction: BEGIN → INSERT row (lấy id) →
-//! ghi blob (ghi `.tmp` + rename atomic) → COMMIT. Như vậy row đã commit luôn có blob, và crash
-//! chỉ để lại blob mồ côi — GC dọn.
+//! Recording a version MUST run inside one transaction: BEGIN → INSERT the row (yielding
+//! the id) → write the blob (`.tmp` + atomic rename) → COMMIT. A committed row therefore
+//! always has its blob, and a crash only leaves an orphan blob — GC cleans it up.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -17,6 +19,8 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::model::*;
 
+/// A local-history store: a SQLite index plus blob files under one root directory.
+/// The connection sits behind a mutex, so a single handle can be shared across threads.
 pub struct LocalHistory {
     pub(crate) conn: Mutex<Connection>,
     pub(crate) root: PathBuf,
@@ -56,24 +60,24 @@ CREATE INDEX idx_versions_file ON versions(file_id, seq);
 "#;
 
 impl LocalHistory {
-    /// Mở (hoặc tạo mới) store tại `root`. Tạo thư mục + schema nếu chưa có.
+    /// Opens (or creates) the store at `root`, creating directories and schema as needed.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        std::fs::create_dir_all(root.join("workspaces"))?; // blobs tạo theo ws khi ghi
+        std::fs::create_dir_all(root.join("workspaces"))?; // blob dirs are created per workspace on write
         let conn = Connection::open(root.join("index.db"))?;
         Self::init_conn(&conn)?;
         Self::migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn), root })
     }
 
-    /// Mở store tại vị trí mặc định: `%LOCALAPPDATA%\local-history` (Windows),
-    /// override bằng env `LOCAL_HISTORY_DIR`.
+    /// Opens the store at `default_root()`.
     pub fn open_default() -> Result<Self> {
         let root = Self::default_root()?;
         Self::open(root)
     }
 
-    /// Mở read-only — dành cho GUI đọc timeline song song với daemon.
+    /// Opens the store read-only — lets the GUI read the timeline alongside the running
+    /// daemon.
     pub fn open_read_only(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let conn = Connection::open_with_flags(
@@ -84,6 +88,8 @@ impl LocalHistory {
         Ok(Self { conn: Mutex::new(conn), root })
     }
 
+    /// Default store root: `%LOCALAPPDATA%\local-history` (Windows), overridable via the
+    /// `LOCAL_HISTORY_DIR` env var.
     pub fn default_root() -> Result<PathBuf> {
         if let Ok(dir) = std::env::var("LOCAL_HISTORY_DIR")
             && !dir.is_empty()
@@ -95,6 +101,7 @@ impl LocalHistory {
             .ok_or_else(|| Error::InvalidPath("không tìm được data_local_dir".into()))
     }
 
+    /// Root directory of this store.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -116,8 +123,8 @@ impl LocalHistory {
         Ok(())
     }
 
-    /// Đăng ký workspace. Id là deterministic theo canonical root — gọi lại với cùng root
-    /// trả về cùng id, không tạo row trùng.
+    /// Registers a workspace. The id is deterministic from the canonical root — calling
+    /// again with the same root returns the same id and does not create a duplicate row.
     pub fn register_workspace(&self, root: impl AsRef<Path>) -> Result<WorkspaceId> {
         let canonical = normalize_canonical(root.as_ref())?;
         let ws_id = ws_id_from_root(&canonical);
@@ -133,7 +140,7 @@ impl LocalHistory {
         Ok(ws_id)
     }
 
-    /// Đường dẫn canonical của workspace (đã strip `\\?\`).
+    /// Canonical root of a workspace (the `\\?\` prefix stripped).
     pub fn workspace_root(&self, ws: WorkspaceId) -> Result<PathBuf> {
         let conn = self.conn.lock().unwrap();
         let root: String = conn
@@ -151,15 +158,15 @@ impl LocalHistory {
         Ok(PathBuf::from(root))
     }
 
-    /// Chuẩn hóa đường dẫn file tuyệt đối thành rel_path (phân tách '/').
-    /// File tồn tại → canonicalize; không tồn tại (event delete) → canonicalize thư mục cha
-    /// rồi ghép tên file.
+    /// Normalizes an absolute file path to a rel_path with `/` separators.
+    /// Existing files are canonicalized directly; missing ones (delete events) canonicalize
+    /// the nearest existing ancestor and re-append the file name.
     pub(crate) fn resolve_rel_path(&self, ws: WorkspaceId, file: &Path) -> Result<String> {
         let ws_root = self.workspace_root(ws)?;
         rel_path_against(&ws_root, file)
     }
 
-    /// Tất cả version của một file, mới nhất trước.
+    /// All versions of a file, newest first.
     pub fn history(&self, ws: WorkspaceId, file: &Path) -> Result<Vec<Version>> {
         let rel = self.resolve_rel_path(ws, file)?;
         let conn = self.conn.lock().unwrap();
@@ -177,8 +184,8 @@ impl LocalHistory {
         Ok(out)
     }
 
-    /// Danh sách file có lịch sử trong workspace, sửa gần nhất trước.
-    /// `prefix` lọc đầu rel_path (không phân biệt hoa thường trên Windows-nghiêng).
+    /// Files with history in the workspace, most recently modified first.
+    /// `prefix` — case-insensitive substring filter on rel_path.
     pub fn list_files(
         &self,
         ws: WorkspaceId,
@@ -228,9 +235,9 @@ impl LocalHistory {
         Ok(out)
     }
 
-    // ----- helper cho GC (retention dùng) -----
+    // ----- helpers used by GC (retention) -----
 
-    /// Quét toàn bộ version của mọi file, group theo file, seq tăng dần.
+    /// Scans all versions of every file, grouped per file with ascending seq.
     pub(crate) fn gc_scan(&self) -> Result<Vec<GcFile>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -254,8 +261,8 @@ impl LocalHistory {
         Ok(out)
     }
 
-    /// Xóa các version theo id (một transaction). Trả về danh sách blob cần xóa trên disk
-    /// (gọi sau khi COMMIT thành công).
+    /// Deletes versions by id (one transaction). Returns the blob files that must be
+    /// removed from disk.
     pub(crate) fn delete_versions(&self, ids: &[VersionId]) -> Result<Vec<BlobRef>> {
         let conn = self.conn.lock().unwrap();
         let mut blobs = Vec::new();
@@ -298,9 +305,7 @@ impl LocalHistory {
         Ok(blobs)
     }
 
-    /// Tất cả workspace: (ws_id, canonical root).
-    /// Dành cho daemon (`lh status`) và CLI ở milestone sau — GC sweep duyệt disk nên chưa dùng.
-    #[allow(dead_code)]
+    /// All workspaces as `(ws_id, canonical root)`.
     pub(crate) fn all_workspaces(&self) -> Result<Vec<(WorkspaceId, PathBuf)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt =
@@ -315,14 +320,13 @@ impl LocalHistory {
         Ok(out)
     }
 
-    /// Danh sách workspace — API public duy nhất để liệt kê: (ws_id, canonical root).
-    /// CLI/GUI cần resolve file → workspace (match canonical root là prefix của file)
-    /// mà không đụng vào internals; wrapper mỏng quanh `all_workspaces` (M3).
+    /// All registered workspaces as `(ws_id, canonical root)` — the one public listing API.
+    /// Consumers resolve a file's workspace by matching a canonical root as a path prefix.
     pub fn workspaces(&self) -> Result<Vec<(WorkspaceId, PathBuf)>> {
         self.all_workspaces()
     }
 
-    /// Set mọi version id còn trong db — dùng để tìm blob mồ côi.
+    /// The set of all version ids still in the db — used to find orphan blobs.
     pub(crate) fn known_version_ids(&self) -> Result<HashSet<VersionId>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT id FROM versions")?;
@@ -334,23 +338,25 @@ impl LocalHistory {
         Ok(out)
     }
 
-    // ----- đường dẫn blob -----
+    // ----- blob paths -----
 
     pub(crate) fn workspaces_dir(&self) -> PathBuf {
         self.root.join("workspaces")
     }
 
+    /// Blob directory of one workspace: `workspaces/<ws:016x>/blobs`.
     pub(crate) fn blobs_dir(&self, ws: WorkspaceId) -> PathBuf {
         self.workspaces_dir().join(format!("{:016x}", ws as u64)).join("blobs")
     }
 
+    /// Blob file of a version: `v<version_id>-<full|delta>.zst`.
     pub(crate) fn blob_path(&self, ws: WorkspaceId, version_id: VersionId, storage: Storage) -> PathBuf {
         self.blobs_dir(ws)
             .join(format!("v{version_id}-{}.zst", storage.as_str()))
     }
 }
 
-/// Tham chiếu blob cần xóa trên disk (do GC trả về sau khi xóa row).
+/// A blob to remove from disk, returned by GC after deleting the rows.
 #[derive(Debug, Clone)]
 pub(crate) struct BlobRef {
     pub ws_id: WorkspaceId,
@@ -358,6 +364,7 @@ pub(crate) struct BlobRef {
     pub storage: Storage,
 }
 
+/// Maps a `versions` row (columns in canonical order) to `Version`.
 pub(crate) fn row_to_version(r: &rusqlite::Row<'_>) -> rusqlite::Result<Version> {
     let kind: String = r.get(4)?;
     let label: Option<String> = r.get(5)?;
@@ -380,12 +387,12 @@ pub(crate) fn row_to_version(r: &rusqlite::Row<'_>) -> rusqlite::Result<Version>
     })
 }
 
-/// Thời gian hiện tại, unix micros UTC.
+/// Current time as unix micros UTC.
 pub(crate) fn now_micros() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 / 1000
 }
 
-/// Canonicalize + strip prefix `\\?\` của Windows (giữ UNC `\\?\UNC\...` → `\\...`).
+/// Canonicalizes a path and strips the Windows `\\?\` prefix (UNC `\\?\UNC\...` → `\\...`).
 pub(crate) fn normalize_canonical(p: &Path) -> Result<PathBuf> {
     let canonical = p.canonicalize().map_err(|e| {
         Error::InvalidPath(format!("{}: {e}", p.display()))
@@ -400,9 +407,10 @@ pub(crate) fn normalize_canonical(p: &Path) -> Result<PathBuf> {
     }
 }
 
-/// rel_path của `file` so với `ws_root` (cả hai phải là đường đã chuẩn hóa), phân tách '/'.
-/// File tồn tại → canonicalize trực tiếp. Không tồn tại (event delete) → canonicalize ancestor
-/// gần nhất còn tồn tại rồi ghép phần còn lại (giữ nguyên casing gốc của phần thiếu).
+/// rel_path of `file` against `ws_root` (both must already be normalized), with `/`
+/// separators. An existing file is canonicalized directly; a missing one (delete event)
+/// canonicalizes the nearest existing ancestor and re-appends the remaining components
+/// (preserving the original casing of the missing part).
 pub(crate) fn rel_path_against(ws_root: &Path, file: &Path) -> Result<String> {
     let abs = if file.exists() {
         normalize_canonical(file)?
@@ -440,7 +448,7 @@ pub(crate) fn rel_path_against(ws_root: &Path, file: &Path) -> Result<String> {
         .join("/"))
 }
 
-/// ws_id deterministic: 8 bytes đầu blake3(canonical root) → u64 → i64 dương.
+/// Deterministic ws_id: first 8 bytes of blake3(canonical root) → u64 → positive i64.
 pub(crate) fn ws_id_from_root(root: &Path) -> WorkspaceId {
     let hash = blake3::hash(root.to_string_lossy().as_bytes());
     let bytes: [u8; 8] = hash.as_bytes()[..8].try_into().unwrap();
@@ -463,7 +471,7 @@ mod tests {
         let conn = store.conn.lock().unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, 1);
-        // 3 bảng tồn tại
+        // the three tables exist
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('workspaces','files','versions')",
@@ -484,7 +492,7 @@ mod tests {
             .register_workspace(PathBuf::from(format!("{}\\", root.display())))
             .unwrap();
         assert_eq!(ws1, ws2);
-        // gọi lại không nhân đôi row
+        // calling again does not duplicate the row
         let cnt: i64 = store
             .conn
             .lock()
@@ -502,7 +510,7 @@ mod tests {
         let file = dir.path().join("a.rs");
         assert!(store.history(ws, &file).unwrap().is_empty());
         assert!(store.list_files(ws, None).unwrap().is_empty());
-        // file ngoài workspace → lỗi
+        // a file outside the workspace → error
         let outside = tempfile::tempdir().unwrap();
         assert!(store.history(ws, outside.path().join("b.rs").as_path()).is_err());
     }
@@ -514,7 +522,7 @@ mod tests {
         std::fs::write(root.join("x.txt"), b"hi").unwrap();
         let rel = rel_path_against(&root, &root.join("x.txt")).unwrap();
         assert_eq!(rel, "x.txt");
-        // file không tồn tại vẫn resolve được
+        // a missing file still resolves
         let rel2 = rel_path_against(&root, &root.join("gone").join("y.txt")).unwrap();
         assert_eq!(rel2, "gone/y.txt");
     }
@@ -527,7 +535,7 @@ mod tests {
         drop(store);
         let ro = LocalHistory::open_read_only(d.path()).unwrap();
         assert!(ro.all_workspaces().unwrap().len() == 1);
-        // read-only không ghi được
+        // read-only cannot write
         assert!(ro.register_workspace(wsdir.path()).is_err());
     }
 }

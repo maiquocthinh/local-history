@@ -1,0 +1,13 @@
+# English strings for the `lh-daemon` tray mode (--tray).
+# Format: one YAML tree per file; the locale is the file stem (en.yml → "en").
+# Nested maps flatten into dotted keys (tray.open_gui, ...).
+# Rule: the key set here must exactly match vi.yml — enforced by the test
+# `i18n_yml_key_parity_and_cover_t_calls` in crates/daemon/src/tray.rs.
+# `%{name}` = placeholder. Values are single-line double-quoted strings.
+tray:
+  tooltip: "local-history daemon — right-click for the menu, double-click to open the GUI"
+  open_gui: "Open GUI"
+  pause_watch: "Pause watch"
+  resume_watch: "Resume watch"
+  gc_now: "Clean up history"
+  quit: "Quit"

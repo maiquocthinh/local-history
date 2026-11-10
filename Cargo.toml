@@ -32,3 +32,5 @@ rfd = "0.18"
 clap = { version = "4", features = ["derive"] }
 rust-i18n = "3"
 sys-locale = "0.3"
+tray-icon = "0.26"
+winit = "0.30"

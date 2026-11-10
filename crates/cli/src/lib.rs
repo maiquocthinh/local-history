@@ -1,20 +1,20 @@
-//! CLI `lh` — giao diện dòng lệnh cho local-history (M3).
+//! CLI `lh` — command-line interface for local-history (M3).
 //!
-//! Toàn bộ logic nằm ở lib (không chỉ main.rs) để test in-process — cùng pattern với crate
-//! `daemon`. Mỗi lệnh một hàm `cmd_*`; helpers (bảng, thời gian, dung lượng, resolve
-//! workspace) có unit test riêng.
+//! All logic lives in the lib (not just main.rs) so tests run in-process — the same pattern
+//! as the `daemon` crate. One `cmd_*` function per subcommand; helpers (tables, time, size,
+//! workspace resolution) have their own unit tests.
 //!
-//! Quy ước đầu ra:
-//! - bảng/text đi qua lớp i18n rust-i18n (crates/cli/locales/en.yml + vi.yml): locale chọn
-//!   bởi `--lang` (en|vi) > env `LH_LANG` > locale hệ điều hành (bắt đầu bằng "vi" → vi,
-//!   không → en);
-//! - `--json`: object/mảng serde_json, key tiếng Anh, ra stdout (value error vẫn dịch theo
-//!   locale);
-//! - lỗi: stderr + exit 1 (có `--json` → `{"error": "..."}` ra stdout cho máy đọc);
-//!   diff nội dung binary → exit 2 (script phân biệt "có lịch sử nhưng binary").
+//! Output conventions:
+//! - tables/text go through the rust-i18n layer (crates/cli/locales/en.yml + vi.yml); the
+//!   locale is chosen by `--lang` (en|vi) > env `LH_LANG` > OS locale (starting with "vi"
+//!   → vi, otherwise en);
+//! - `--json`: serde_json objects/arrays with English keys on stdout (error values are
+//!   still rendered in the chosen locale);
+//! - errors: stderr + exit 1 (with `--json` → `{"error": "..."}` on stdout for machines);
+//!   diffing binary content → exit 2 (scripts distinguish "has history but binary").
 //!
-//! Không thêm dep ngoài i18n: định dạng thời gian/dung lượng/bảng tự viết (engine
-//! `time`/`chrono` không có trong deps của crate này).
+//! No extra deps beyond i18n: time/size/table formatting is hand-rolled (the `time`/`chrono`
+//! engines are not deps of this crate).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -24,27 +24,29 @@ use clap::{Parser, Subcommand};
 use rust_i18n::t;
 use serde_json::json;
 
-// Nạp bản dịch từ crates/cli/locales (nhúng lúc biên dịch); thiếu bản dịch → fallback en.
+// Load translations from crates/cli/locales (embedded at compile time); missing keys fall back to en.
 rust_i18n::i18n!("locales", fallback = "en");
 
 use history::{EventKind, LocalHistory, RetentionPolicy, Version, WorkspaceId};
 
+/// Result type shared by all fallible helpers in this crate: every failure becomes a `CliError`.
 pub type Result<T> = std::result::Result<T, CliError>;
 
-// ---------- lỗi ----------
+// ---------- errors ----------
 
-/// Lỗi CLI — in thẳng cho người dùng; `exit_code` quyết định code thoát.
+/// CLI error — printed directly to the user; `exit_code` decides the process exit code.
 #[derive(Debug)]
 pub enum CliError {
-    /// Lỗi từ engine `history`.
+    /// Propagated from the `history` engine.
     History(history::Error),
-    /// Nội dung binary không diff được — exit 2.
+    /// Content that cannot be diffed because it is binary — exit code 2.
     Binary(String),
-    /// Lỗi nghiệp vụ CLI (message đã viết sẵn cho người dùng).
+    /// CLI-level failure carrying an already user-ready message.
     Msg(String),
 }
 
 impl CliError {
+    /// Process exit code: 2 for binary-content failures, 1 for every other error.
     pub fn exit_code(&self) -> i32 {
         match self {
             CliError::Binary(_) => 2,
@@ -78,8 +80,9 @@ impl From<std::io::Error> for CliError {
     }
 }
 
-// ---------- định nghĩa lệnh (clap derive) ----------
+// ---------- command definitions (clap derive) ----------
 
+/// Root command of `lh`: global flags plus the subcommand to run.
 #[derive(Debug, Parser)]
 #[command(
     name = "lh",
@@ -89,15 +92,15 @@ impl From<std::io::Error> for CliError {
     arg_required_else_help = true
 )]
 pub struct Cli {
-    /// In JSON thay vì bảng (key tiếng Anh, ra stdout)
+    /// Emit JSON instead of tables (English keys, written to stdout)
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Override store root (mặc định: env LOCAL_HISTORY_DIR hoặc %LOCALAPPDATA%\local-history)
+    /// Override the store root (default: env LOCAL_HISTORY_DIR or %LOCALAPPDATA%\local-history)
     #[arg(long, global = true, value_name = "PATH")]
     pub store: Option<PathBuf>,
 
-    /// Ngôn ngữ output: en | vi (mặc định: env LH_LANG, hoặc theo hệ điều hành)
+    /// Output language: en | vi (default: env LH_LANG, or the OS locale)
     #[arg(long, global = true, value_name = "LANG")]
     pub lang: Option<String>,
 
@@ -105,70 +108,71 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// One variant per `lh` subcommand.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Trạng thái daemon + danh sách workspace
+    /// Daemon status plus a workspace overview
     Status,
-    /// Timeline của một file
+    /// Timeline of one file
     History {
-        /// Đường dẫn file (tuyệt đối hoặc tương đối)
+        /// File path (absolute or relative)
         file: PathBuf,
     },
-    /// In nội dung một version ra stdout (hoặc ghi file với -o)
+    /// Print a version's content to stdout (or write it to a file with -o)
     Show {
         file: PathBuf,
-        /// Seq của version, hoặc `latest` cho bản mới nhất
+        /// Version seq, or `latest` for the newest entry
         #[arg(long)]
         at: String,
-        /// Ghi ra file thay vì stdout
+        /// Write to a file instead of stdout
         #[arg(short = 'o', long = "output", value_name = "FILE")]
         output: Option<PathBuf>,
     },
-    /// Unified diff giữa hai version (b = seq, hoặc `current` = nội dung disk hiện tại)
+    /// Unified diff between two versions (`b` = seq, or `current` = on-disk content)
     Diff {
         file: PathBuf,
-        /// Seq version bên trái
+        /// Seq of the left side
         a: String,
-        /// Seq version bên phải, hoặc `current`
+        /// Seq of the right side, or `current`
         b: String,
     },
-    /// Khôi phục file về nội dung của một version (luôn sinh pre_revert trước khi ghi đè)
+    /// Restore a file to a version's content (always records pre_revert before overwriting)
     Revert {
         file: PathBuf,
-        /// Seq version cần khôi phục
+        /// Seq of the version to restore
         #[arg(long)]
         at: String,
-        /// Bỏ qua câu hỏi xác nhận
+        /// Skip the confirmation prompt
         #[arg(long)]
         yes: bool,
     },
-    /// Gắn label ngữ nghĩa (tạo version kind=label với nội dung hiện tại trên disk)
+    /// Attach a semantic label (creates a kind=label version from current on-disk content)
     Label {
         file: PathBuf,
-        /// Nội dung label (nhiều từ được, ghép lại bằng khoảng trắng)
+        /// Label text (multiple words allowed; joined with spaces)
         #[arg(required = true)]
         text: Vec<String>,
     },
-    /// Dọn version cũ theo retention (mặc định: 5 ngày làm việc, giữ 50 version/file)
+    /// Prune old versions per the retention policy (default: 5 working days, 50 versions/file)
     Gc {
-        /// Chỉ xem trước, không xóa gì
+        /// Preview only; delete nothing
         #[arg(long)]
         dry_run: bool,
     },
-    /// Danh sách workspace trong store
+    /// Workspaces registered in the store
     Workspaces,
-    /// Mở GUI (lh-gui) detached — trả về ngay
+    /// Launch the GUI (lh-gui) detached — returns immediately
     Ui {
-        /// File mở thẳng timeline (tùy chọn)
+        /// Open the timeline for this file (optional)
         file: Option<PathBuf>,
     },
 }
 
-/// Điểm vào chính — trả exit code (main.rs chỉ `std::process::exit` với giá trị này).
+/// Main entry point — returns the exit code (main.rs only calls `std::process::exit` with it).
 pub fn run(cli: Cli) -> i32 {
-    // set_locale NGAY ĐẦU run() — mọi chuỗi phía sau đi qua lớp i18n theo locale này.
-    // `--lang` sai giá trị: vẫn set locale theo hệ thống trước để thông báo lỗi ra đúng
-    // ngôn ngữ người dùng, rồi báo lỗi rõ (exit 1).
+    // set_locale first — every string below goes through the i18n layer in this locale.
+    // An invalid `--lang` still sets the locale first so the error is rendered in the
+    // user's language, then fails with a clear message (exit 1).
     rust_i18n::set_locale(&lang_choice(cli.lang.as_deref()));
 
     let result = match parse_lang(cli.lang.as_deref().unwrap_or("en")) {
@@ -178,8 +182,9 @@ pub fn run(cli: Cli) -> i32 {
     report(cli.json, result)
 }
 
-/// In kết quả: ok → exit 0; lỗi → json mode in `{"error": ...}` ra stdout (máy đọc được
-/// cùng một kênh), text mode in `lh: <lỗi>` ra stderr; exit code theo `CliError::exit_code`.
+/// Report the outcome: ok → exit 0; on error, JSON mode prints `{"error": ...}` to stdout
+/// (machine-readable on the same channel), text mode prints `lh: <error>` to stderr; the
+/// exit code comes from `CliError::exit_code`.
 fn report(json_mode: bool, result: Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
@@ -194,13 +199,14 @@ fn report(json_mode: bool, result: Result<()>) -> i32 {
     }
 }
 
-/// Locale dùng cho phiên chạy: `--lang` hợp lệ > env `LH_LANG` > locale hệ điều hành.
-/// `--lang` sai giá trị → rơi về auto (lỗi được báo sau khi locale đã set, xem `run`).
+/// Locale for this run: valid `--lang` > env `LH_LANG` > OS locale.
+/// An invalid `--lang` falls back to auto (the error is reported after the locale is set,
+/// see `run`).
 fn lang_choice(flag: Option<&str>) -> String {
     flag.and_then(normalize_lang).unwrap_or_else(auto_lang)
 }
 
-/// Chuẩn hóa "en"|"vi" (trim khoảng trắng, không phân biệt hoa/thường); khác → None.
+/// Normalize to "en"|"vi" (trimmed, case-insensitive); anything else → None.
 fn normalize_lang(s: &str) -> Option<String> {
     match s.trim().to_ascii_lowercase().as_str() {
         "en" => Some("en".into()),
@@ -209,14 +215,14 @@ fn normalize_lang(s: &str) -> Option<String> {
     }
 }
 
-/// Parse giá trị `--lang`/`LH_LANG` → "en"|"vi"; sai → lỗi rõ `err.bad_lang`
-/// (message được dựng theo locale hiện tại).
+/// Parse a `--lang`/`LH_LANG` value into "en"|"vi"; invalid → clear `err.bad_lang` error
+/// (message rendered in the current locale).
 fn parse_lang(s: &str) -> Result<String> {
     normalize_lang(s).ok_or_else(|| CliError::Msg(t!("err.bad_lang", v = s).to_string()))
 }
 
-/// Locale tự động: env `LH_LANG` nếu là en|vi, nếu không theo hệ điều hành
-/// (`sys_locale` bắt đầu bằng "vi" → vi, không → en).
+/// Auto locale: env `LH_LANG` if it is en|vi, otherwise the OS locale (`sys_locale`
+/// starting with "vi" → vi, otherwise en).
 fn auto_lang() -> String {
     if let Ok(v) = std::env::var("LH_LANG")
         && let Some(l) = normalize_lang(&v)
@@ -245,8 +251,8 @@ fn dispatch(cli: &Cli) -> Result<()> {
 
 // ---------- store helpers ----------
 
-/// Root store: `--store` override, nếu không thì mặc định của engine (env `LOCAL_HISTORY_DIR`
-/// hoặc `%LOCALAPPDATA%\local-history`).
+/// Store root: `--store` override, otherwise the engine default (env `LOCAL_HISTORY_DIR`
+/// or `%LOCALAPPDATA%\local-history`).
 fn store_root(cli: &Cli) -> Result<PathBuf> {
     match &cli.store {
         Some(p) => Ok(p.clone()),
@@ -254,7 +260,7 @@ fn store_root(cli: &Cli) -> Result<PathBuf> {
     }
 }
 
-/// Mở store để ĐỌC. Chưa có index.db → lỗi rõ (không tự tạo store từ lệnh đọc).
+/// Open the store READ-ONLY. Missing index.db → clear error (read commands never create a store).
 fn open_read(root: &Path) -> Result<LocalHistory> {
     if !root.join("index.db").exists() {
         return Err(CliError::Msg(
@@ -264,9 +270,9 @@ fn open_read(root: &Path) -> Result<LocalHistory> {
     Ok(LocalHistory::open_read_only(root)?)
 }
 
-// ---------- các lệnh ----------
+// ---------- commands ----------
 
-/// Tổng quan một workspace: (ws_id, root, số file, tổng số version).
+/// Per-workspace overview: (workspace id, root, file count, total version count).
 type WsOverview = Vec<(WorkspaceId, PathBuf, usize, i64)>;
 
 fn ws_overview(store: &LocalHistory) -> Result<WsOverview> {
@@ -302,7 +308,7 @@ fn ws_rows(overview: &WsOverview) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Header bảng workspace (dùng chung cho `lh status` và `lh workspaces`) — đi qua i18n.
+/// Workspace table header (shared by `lh status` and `lh workspaces`) — localized.
 fn ws_header() -> Vec<String> {
     vec![
         t!("ws.col.id").to_string(),
@@ -316,7 +322,7 @@ fn cmd_status(cli: &Cli) -> Result<()> {
     let root = store_root(cli)?;
     let daemon_status = daemon::read_status(&root);
 
-    // Store chưa có db (chưa từng ghi) → coi như rỗng, không lỗi.
+    // No db yet (nothing recorded) → treat as empty instead of failing.
     let overview = if root.join("index.db").exists() {
         let store = open_read(&root)?;
         ws_overview(&store)?
@@ -476,7 +482,7 @@ fn cmd_show(cli: &Cli, file: &Path, at: &str, output: Option<&Path>) -> Result<(
             );
         }
         None => {
-            // bytes thô ra stdout (binary-safe) — write trên stdout.lock()
+            // raw bytes to stdout (binary-safe) — write via stdout.lock()
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
             lock.write_all(&data)?;
@@ -486,7 +492,7 @@ fn cmd_show(cli: &Cli, file: &Path, at: &str, output: Option<&Path>) -> Result<(
     Ok(())
 }
 
-/// BinaryContent → CliError::Binary (message rõ + exit 2); lỗi khác truyền qua.
+/// Map `BinaryContent` to `CliError::Binary` (clear message + exit 2); other errors pass through.
 fn map_binary(r: history::Result<String>) -> Result<String> {
     match r {
         Ok(text) => Ok(text),
@@ -526,7 +532,7 @@ fn cmd_diff(cli: &Cli, file: &Path, a: &str, b: &str) -> Result<()> {
 
 fn cmd_revert(cli: &Cli, file: &Path, at: &str, yes: bool) -> Result<()> {
     let root = store_root(cli)?;
-    let store = LocalHistory::open(&root)?; // rw — revert ghi cả disk lẫn index
+    let store = LocalHistory::open(&root)?; // rw — revert writes both disk and index
     let (ws, _) = resolve_ws_for_file(&store, file)?;
     let versions = store.history(ws, file)?;
     let v = pick_by_seq(&versions, at)?;
@@ -547,8 +553,8 @@ fn cmd_revert(cli: &Cli, file: &Path, at: &str, yes: bool) -> Result<()> {
         std::io::stdout().flush()?;
         let mut ans = String::new();
         std::io::stdin().read_line(&mut ans)?;
-        let t = ans.trim();
-        if !(t.eq_ignore_ascii_case("y") || t.eq_ignore_ascii_case("yes")) {
+        let reply = ans.trim();
+        if !(reply.eq_ignore_ascii_case("y") || reply.eq_ignore_ascii_case("yes")) {
             if cli.json {
                 println!("{}", json!({ "reverted": false, "reason": "cancelled" }));
             } else {
@@ -559,8 +565,9 @@ fn cmd_revert(cli: &Cli, file: &Path, at: &str, yes: bool) -> Result<()> {
     }
 
     store.revert(ws, file, v.id)?;
-    // Sau revert: version mới nhất kind=PreRevert (nếu disk trước đó khác target) là snapshot
-    // an toàn; restore nằm trên nó. Disk đã khớp sẵn → engine không ghi gì.
+    // After revert: the newest PreRevert version (recorded when disk differed from the
+    // target) is the safety snapshot the restore sits on. Disk already matched → the
+    // engine writes nothing.
     let after = store.history(ws, file)?;
     let pre = after.iter().find(|x| x.kind == EventKind::PreRevert);
     if cli.json {
@@ -587,7 +594,7 @@ fn cmd_label(cli: &Cli, file: &Path, text: &[String]) -> Result<()> {
         return Err(CliError::Msg(t!("err.empty_label").to_string()));
     }
     let root = store_root(cli)?;
-    let store = LocalHistory::open(&root)?; // rw — add_label tạo version
+    let store = LocalHistory::open(&root)?; // rw — add_label records a version
     let (ws, _) = resolve_ws_for_file(&store, file)?;
     let vid = store.add_label(ws, file, &text)?;
     let seq = store
@@ -695,13 +702,13 @@ fn cmd_ui(cli: &Cli, file: Option<&Path>) -> Result<()> {
 
     let mut cmd = std::process::Command::new(&gui);
     if let Some(f) = file {
-        // GUI tự canonicalize + resolve workspace (contract `lh-gui --file <path>`)
+        // GUI canonicalizes and resolves the workspace itself (contract: `lh-gui --file <path>`)
         cmd.args(["--file", &f.display().to_string()]);
     }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // detached: không console, process group riêng — GUI sống độc lập với lh
+        // detached: no console, separate process group — the GUI outlives lh
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
@@ -723,8 +730,9 @@ fn cmd_ui(cli: &Cli, file: Option<&Path>) -> Result<()> {
 
 // ---------- resolve file → workspace ----------
 
-/// Resolve file → (workspace id, ws root): match canonical root là prefix của file, chọn ws
-/// có root DÀI nhất (workspace lồng nhau → cụ thể nhất thắng). Ngoài mọi ws → lỗi rõ.
+/// Resolve a file to (workspace id, workspace root): the workspace whose root is a prefix
+/// of the file wins; with nested workspaces the LONGEST root (most specific) wins.
+/// Outside every workspace → clear error.
 pub fn resolve_ws_for_file(store: &LocalHistory, file: &Path) -> Result<(WorkspaceId, PathBuf)> {
     let abs = normalized_abs(file)?;
     let mut best: Option<(usize, WorkspaceId, PathBuf)> = None;
@@ -742,10 +750,10 @@ pub fn resolve_ws_for_file(store: &LocalHistory, file: &Path) -> Result<(Workspa
         })
 }
 
-/// Đưa đường dẫn về tuyệt đối đã chuẩn hóa: tồn tại → canonicalize (strip `\\?\`);
-/// chưa tồn tại (vd file đã bị xóa) → canonicalize ancestor gần nhất còn tồn tại rồi ghép
-/// phần đuôi. Khớp quy ước của engine (`normalize_canonical`/`rel_path_against`) để so
-/// prefix chính xác với root đã lưu trong db.
+/// Absolute normalized path: existing files → canonicalize (strip `\\?\`); missing files
+/// (e.g. already deleted) → canonicalize the nearest surviving ancestor and re-append the
+/// tail. Matches the engine's convention (`normalize_canonical`/`rel_path_against`) so the
+/// prefix check against roots stored in the db is exact.
 fn normalized_abs(file: &Path) -> Result<PathBuf> {
     let original = file.display().to_string();
     let file = if file.is_absolute() {
@@ -784,7 +792,7 @@ fn normalized_abs(file: &Path) -> Result<PathBuf> {
     Ok(abs)
 }
 
-/// Canonicalize + strip prefix `\\?\` của Windows (giữ UNC `\\?\UNC\...` → `\\...`).
+/// Canonicalize and strip the Windows `\\?\` prefix (UNC `\\?\UNC\...` → `\\...`).
 fn canonical_lossy(p: &Path) -> Result<PathBuf> {
     let c = p.canonicalize().map_err(|e| {
         CliError::Msg(t!("err.canonicalize", path = p.display(), err = e).to_string())
@@ -799,7 +807,7 @@ fn canonical_lossy(p: &Path) -> Result<PathBuf> {
     })
 }
 
-/// `path` nằm TRONG `root` (so component, không phân biệt hoa thường trên Windows)?
+/// Is `path` strictly INSIDE `root` (component-wise; case-insensitive on Windows)?
 fn under_root(path: &Path, root: &Path) -> bool {
     let pc: Vec<_> = path.components().collect();
     let rc: Vec<_> = root.components().collect();
@@ -818,14 +826,16 @@ fn under_root(path: &Path, root: &Path) -> bool {
 
 // ---------- version helpers ----------
 
-/// `--at <SEQ|latest>`.
+/// Selector for a version in a file's history: the newest entry or an explicit seq.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum At {
+    /// Newest version in the history.
     Latest,
+    /// Version with this seq.
     Seq(i64),
 }
 
-/// Parse `--at`: `latest` (không phân biệt hoa thường) hoặc số seq.
+/// Parse `--at`: `latest` (case-insensitive) or a numeric seq.
 pub fn parse_at(s: &str) -> Result<At> {
     if s.eq_ignore_ascii_case("latest") {
         return Ok(At::Latest);
@@ -833,7 +843,7 @@ pub fn parse_at(s: &str) -> Result<At> {
     Ok(At::Seq(parse_seq(s)?))
 }
 
-/// Parse seq: số nguyên ≥ 0.
+/// Parse a seq: non-negative integer.
 pub fn parse_seq(s: &str) -> Result<i64> {
     let n: i64 = s
         .trim()
@@ -845,7 +855,7 @@ pub fn parse_seq(s: &str) -> Result<i64> {
     Ok(n)
 }
 
-/// Tìm version theo seq trong danh sách (mới nhất trước). Không thấy → lỗi rõ kèm phạm vi.
+/// Find a version by seq in a newest-first list. Missing → clear error including the seq range.
 fn find_by_seq(versions: &[Version], seq: i64) -> Result<Version> {
     versions
         .iter()
@@ -869,7 +879,7 @@ fn find_by_seq(versions: &[Version], seq: i64) -> Result<Version> {
         })
 }
 
-/// `--at` → version cụ thể (`latest` = bản mới nhất trong history).
+/// Resolve an `--at` value to a concrete version (`latest` = newest in the history).
 fn pick_version(versions: &[Version], at: &str) -> Result<Version> {
     if versions.is_empty() {
         return Err(CliError::Msg(t!("err.no_versions").to_string()));
@@ -880,7 +890,7 @@ fn pick_version(versions: &[Version], at: &str) -> Result<Version> {
     }
 }
 
-/// Như `pick_version` nhưng CHỈ nhận seq (dùng cho hai bên của `lh diff`).
+/// Like `pick_version` but accepts ONLY a seq (used for both sides of `lh diff`).
 fn pick_by_seq(versions: &[Version], s: &str) -> Result<Version> {
     if versions.is_empty() {
         return Err(CliError::Msg(t!("err.no_versions").to_string()));
@@ -889,24 +899,24 @@ fn pick_by_seq(versions: &[Version], s: &str) -> Result<Version> {
     find_by_seq(versions, seq)
 }
 
-// ---------- helpers: thời gian / dung lượng / bảng / pid ----------
+// ---------- helpers: time / size / table / pid ----------
 
-/// unix micros → `YYYY-MM-DD HH:MM:SS` (UTC — crate time/chrono không có trong deps cli,
-/// tự viết). Thuật toán civil-from-days (Howard Hinnant) — đúng cho ngày trước 1970,
-/// năm nhuận và quy tắc century (2100 không nhuận).
+/// Unix micros → `YYYY-MM-DD HH:MM:SS` (UTC — hand-rolled because `time`/`chrono` are not
+/// deps of this crate). civil-from-days (Howard Hinnant) — correct for pre-1970 dates,
+/// leap years and the century rule (2100 is not a leap year).
 pub fn format_time(micros: i64) -> String {
     let secs = micros.div_euclid(1_000_000);
     let days = secs.div_euclid(86_400);
-    let sod = secs.rem_euclid(86_400); // giây trong ngày [0, 86399]
+    let sod = secs.rem_euclid(86_400); // seconds of day [0, 86399]
     let (y, m, d) = civil_from_days(days);
     let (hh, mm, ss) = (sod / 3600, (sod % 3600) / 60, sod % 60);
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
 }
 
-/// Số ngày kể từ 1970-01-01 → (năm, tháng, ngày). Tham chiếu: Howard Hinnant,
-/// "chrono-Compatible Low-Level Date Algorithms" (được điều chỉnh div_euclid cho âm).
+/// Days since 1970-01-01 → (year, month, day). Reference: Howard Hinnant,
+/// "chrono-Compatible Low-Level Date Algorithms" (adapted to div_euclid for negatives).
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468; // dịch về mốc 0000-03-01
+    let z = days + 719_468; // shift to the 0000-03-01 epoch
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097); // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
@@ -919,7 +929,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (y, m as u32, d as u32)
 }
 
-/// Định dạng dung lượng người đọc được: B / KB / MB / GB (1 KB = 1024 B).
+/// Human-readable size: B / KB / MB / GB (1 KB = 1024 B).
 pub fn human_size(bytes: u64) -> String {
     const K: f64 = 1024.0;
     let b = bytes as f64;
@@ -934,7 +944,7 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
-/// Padding cột canh trái — đếm theo CHAR (label tiếng Việt có dấu, không đếm bytes).
+/// Left-pad a table cell — counted in CHARACTERS (accented labels are multi-byte), not bytes.
 fn pad(s: &str, width: usize) -> String {
     let n = s.chars().count();
     if n >= width {
@@ -944,8 +954,8 @@ fn pad(s: &str, width: usize) -> String {
     }
 }
 
-/// Bảng cột đơn giản: header + đường kẻ + body, canh trái, gap 2 khoảng trắng. Không dep.
-/// Header là chuỗi đã i18n — width canh lại theo header (header dài hơn cell → dãn cột ra).
+/// Minimal table: header + rule + body, left-aligned, two-space gaps. No deps.
+/// The header is already localized — widths account for it (a longer header widens the column).
 fn print_table(header: &[String], rows: &[Vec<String>]) {
     let ncol = header.len();
     let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
@@ -973,9 +983,9 @@ fn print_table(header: &[String], rows: &[Vec<String>]) {
     }
 }
 
-/// pid còn sống? Windows: `tasklist /FI "PID eq <pid>" /NH /FO CSV` — parse cột pid;
-/// dòng "INFO: ..." (không thấy process) chỉ có 1 cột → không match. OS khác: /proc.
-/// Lỗi chạy lệnh → false (thận trọng: báo "không phản hồi").
+/// Is the pid alive? Windows: `tasklist /FI "PID eq <pid>" /NH /FO CSV` — parse the pid
+/// column; an "INFO: ..." line (no such process) has a single column → no match. Other
+/// OSes: /proc. Command failure → false (conservative: report "not responding").
 #[cfg(windows)]
 fn pid_alive(pid: u32) -> bool {
     let out = match std::process::Command::new("tasklist")
@@ -998,7 +1008,7 @@ fn pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// unix micros hiện tại (cho gc dry-run) — cùng quy ước với engine/daemon.
+/// Current unix micros (for gc dry-run) — same convention as engine/daemon.
 fn now_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1021,25 +1031,25 @@ mod tests {
 
     #[test]
     fn format_time_negative_micros() {
-        // 1 micros trước epoch
+        // one microsecond before the epoch
         assert_eq!(format_time(-1), "1969-12-31 23:59:59");
     }
 
     #[test]
     fn format_time_known_value() {
-        // 1700000000s = 2023-11-14 22:13:20 UTC (giá trị tham chiếu public)
+        // 1700000000s = 2023-11-14 22:13:20 UTC (public reference value)
         assert_eq!(format_time(1_700_000_000_000_000), "2023-11-14 22:13:20");
     }
 
     #[test]
     fn format_time_leap_day() {
-        // 2024 nhuận: 29/02 tồn tại
+        // 2024 is a leap year: Feb 29 exists
         assert_eq!(format_time(1_709_164_800_000_000), "2024-02-29 00:00:00");
     }
 
     #[test]
     fn format_time_century_non_leap() {
-        // 2100 KHÔNG nhuận (div 100, không div 400): 28/02 → 01/03, không có 29/02
+        // 2100 is NOT a leap year (div 100 but not div 400): Feb 28 → Mar 01, no Feb 29
         let feb28: i64 = 4_107_456_000_000_000;
         assert_eq!(format_time(feb28), "2100-02-28 00:00:00");
         assert_eq!(format_time(feb28 + 86_400_000_000), "2100-03-01 00:00:00");
@@ -1083,9 +1093,9 @@ mod tests {
         let p = Path::new(r"D:\Work\Proj\a.txt");
         assert!(under_root(p, Path::new(r"D:\Work\Proj")));
         assert!(!under_root(p, Path::new(r"D:\Other")));
-        // bằng nhau → không tính là "bên trong"
+        // equal paths → not "inside"
         assert!(!under_root(Path::new(r"D:\Work\Proj"), Path::new(r"D:\Work\Proj")));
-        // Windows: hoa thường không phân biệt
+        // Windows: case-insensitive
         if cfg!(windows) {
             assert!(under_root(p, Path::new(r"D:\WORK\proj")));
         }
@@ -1096,37 +1106,37 @@ mod tests {
         let store_dir = tempfile::tempdir().unwrap();
         let store = LocalHistory::open(store_dir.path()).unwrap();
         let ws_a = tempfile::tempdir().unwrap();
-        let ws_b = tempfile::tempdir_in(ws_a.path()).unwrap(); // ws lồng trong ws_a
+        let ws_b = tempfile::tempdir_in(ws_a.path()).unwrap(); // workspace nested inside ws_a
         let id_a = store.register_workspace(ws_a.path()).unwrap();
         let id_b = store.register_workspace(ws_b.path()).unwrap();
 
-        // file tồn tại trong ws con → chọn root dài nhất (cụ thể nhất)
+        // file inside the nested workspace → the longest (most specific) root wins
         let f_b = ws_b.path().join("x.txt");
         std::fs::write(&f_b, b"hi").unwrap();
         let (got, root_b) = resolve_ws_for_file(&store, &f_b).unwrap();
         assert_eq!(got, id_b);
-        // assert trên path đã normalize (tempdir raw có thể khác canonical qua junction)
+        // assert on the normalized path (raw tempdir may differ from canonical via junctions)
         assert!(under_root(&normalized_abs(&f_b).unwrap(), &root_b));
 
-        // file trong ws cha (không rơi vào ws con)
+        // file in the parent workspace (does not fall into the nested one)
         let f_a = ws_a.path().join("y.txt");
         std::fs::write(&f_a, b"hi").unwrap();
         let (got2, root_a) = resolve_ws_for_file(&store, &f_a).unwrap();
         assert_eq!(got2, id_a);
         assert!(under_root(&normalized_abs(&f_a).unwrap(), &root_a));
 
-        // file KHÔNG tồn tại vẫn resolve được (ancestor gần nhất còn tồn tại)
+        // non-existent files still resolve (nearest surviving ancestor)
         let (got3, _) = resolve_ws_for_file(&store, &ws_a.path().join("gone").join("z.txt")).unwrap();
         assert_eq!(got3, id_a);
 
-        // đường tương đối → resolve theo cwd (chạy trong ws_a)
+        // relative path → resolved against cwd (running inside ws_a)
         let old_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(ws_a.path()).unwrap();
         let got4 = resolve_ws_for_file(&store, Path::new("y.txt")).unwrap();
         std::env::set_current_dir(old_cwd).unwrap();
         assert_eq!(got4.0, id_a);
 
-        // ngoài mọi ws → lỗi rõ (assert token "workspace" ổn định ở cả 2 locale)
+        // outside every workspace → clear error (assert on "workspace", stable in both locales)
         let outside = tempfile::tempdir().unwrap();
         let f_out = outside.path().join("q.txt");
         std::fs::write(&f_out, b"hi").unwrap();
@@ -1150,7 +1160,7 @@ mod tests {
             size: 0,
             content_hash: String::new(),
         };
-        let versions = vec![mk(3), mk(2), mk(1)]; // mới nhất trước
+        let versions = vec![mk(3), mk(2), mk(1)]; // newest first
         assert_eq!(find_by_seq(&versions, 2).unwrap().seq, 2);
         let err = find_by_seq(&versions, 9).unwrap_err().to_string();
         assert!(err.contains("seq 1..3"), "{err}");
@@ -1158,8 +1168,8 @@ mod tests {
 
     // ----- i18n -----
 
-    /// set_locale là trạng thái toàn cục của process — khóa để các test đổi locale không
-    /// đua với test khác đang đọc message.
+    /// set_locale is process-global state — this lock keeps locale-switching tests from
+    /// racing tests that read messages in the ambient locale.
     static LOCALE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -1185,7 +1195,7 @@ mod tests {
             t!("status.daemon_stopped", locale = "en"),
             "daemon     : not running"
         );
-        // prompt xác nhận giữ dấu cách cuối — sau "[y/N] " người dùng gõ ngay trên cùng dòng
+        // the confirm prompt keeps its trailing space — the user types right after "[y/N] "
         assert!(t!("revert.confirm", locale = "vi", seq = 3).ends_with("[y/N] "));
         assert!(t!("revert.confirm", locale = "en", seq = 3).ends_with("[y/N] "));
     }
@@ -1193,13 +1203,13 @@ mod tests {
     #[test]
     fn i18n_invalid_locale_falls_back_to_en() {
         let _guard = LOCALE_TEST_LOCK.lock().unwrap();
-        // locale không tồn tại trong locales/*.yml → rơi về fallback "en"
+        // a locale absent from locales/*.yml → falls back to "en"
         rust_i18n::set_locale("fr");
         assert_eq!(t!("err.no_versions"), "file has no versions yet");
-        // đường đi thật của run(): set_locale("vi") rồi tra cứu KHÔNG ghi rõ locale
+        // the real run() path: set_locale("vi") then look up WITHOUT naming the locale
         rust_i18n::set_locale("vi");
         assert_eq!(t!("err.no_versions"), "file chưa có version nào");
-        rust_i18n::set_locale("en"); // trả về mặc định cho test khác
+        rust_i18n::set_locale("en"); // restore the default for other tests
     }
 
     #[test]
@@ -1207,11 +1217,11 @@ mod tests {
         assert_eq!(parse_lang("en").unwrap(), "en");
         assert_eq!(parse_lang("VI").unwrap(), "vi");
         assert_eq!(parse_lang(" vi ").unwrap(), "vi");
-        // lang_choice: flag hợp lệ thắng; sai giá trị thì thử ở parse_lang phía sau
+        // lang_choice: a valid flag wins; an invalid one is reported later by parse_lang
         assert_eq!(lang_choice(Some("en")), "en");
         assert_eq!(lang_choice(Some("vi")), "vi");
         let err = parse_lang("fr").unwrap_err().to_string();
-        // token "--lang" xuất hiện ở cả 2 locale — assert không phụ thuộc locale hiện tại
+        // the "--lang" token appears in both locales — the assert is locale-independent
         assert!(err.contains("--lang"), "{err}");
     }
 
@@ -1220,7 +1230,7 @@ mod tests {
         let en = yml_keys(include_str!("../locales/en.yml"));
         let vi = yml_keys(include_str!("../locales/vi.yml"));
 
-        // không có key trùng trong cùng 1 file (YAML trùng key bị nuốt im lặng)
+        // no duplicate keys within one file (YAML silently swallows duplicates)
         for (name, keys) in [("en", &en), ("vi", &vi)] {
             let mut seen = std::collections::BTreeSet::new();
             for k in keys {
@@ -1242,7 +1252,8 @@ mod tests {
             "2 file yml lệch tập key — chỉ có ở en: {only_en:?} · chỉ có ở vi: {only_vi:?}"
         );
 
-        // mọi key được gọi dịch trong lib.rs phải được định nghĩa trong yml (không quên dịch)
+        // every key used in translation calls within lib.rs must be defined in the yml
+        // (no missed translation)
         for key in t_keys_in_source(include_str!("lib.rs")) {
             assert!(
                 en.contains(&key),
@@ -1251,9 +1262,9 @@ mod tests {
         }
     }
 
-    /// Parser tối giản đúng định dạng locales/*.yml của crate này: mỗi file là 1 cây YAML
-    /// (locale = tên file), map lồng nhiều cấp (namespace → nhóm → key), value là chuỗi
-    /// double-quoted nằm trọn 1 dòng. Trả về key đầy đủ "a.b.c" theo thứ tự file.
+    /// Minimal parser matching this crate's locales/*.yml format: one YAML tree per file
+    /// (locale = file name), nested maps (namespace → group → key), double-quoted values
+    /// kept on a single line. Returns full "a.b.c" keys in file order.
     fn yml_keys(yml: &str) -> Vec<String> {
         let mut keys = Vec::new();
         let mut stack: Vec<(usize, &str)> = Vec::new();
@@ -1286,10 +1297,11 @@ mod tests {
         keys
     }
 
-    /// Quét source lấy mọi key gọi qua macro dịch (macro 2 ký hiệu "t" + "!(")
-    /// — bỏ qua dòng comment, chỉ nhận key namespaced (chữ/số/gạch dưới, có dấu chấm).
-    /// Lưu ý: nhiều macro chuẩn (`assert!`, `print!`, `concat!`...) cũng chứa chuỗi
-    /// "t" + "!(" — prefix được dựng lúc chạy và key bị lọc chặt để không bắt nhầm.
+    /// Scan the source for keys passed to the translation macro (two tokens: "t" followed
+    /// by "!(") — skip comment lines, accept only namespaced keys (alphanumerics/underscore/
+    /// dash, containing a dot). Note: many standard macros (`assert!`, `print!`, `concat!`...)
+    /// also contain that token pair — the prefix is built at runtime and the key filter
+    /// is strict to avoid false positives.
     fn t_keys_in_source(src: &str) -> Vec<String> {
         let call_prefix = "t~!~(".replace('~', "");
         let mut keys = Vec::new();

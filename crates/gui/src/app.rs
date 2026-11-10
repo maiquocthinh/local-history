@@ -1,5 +1,7 @@
-//! App GUI — bố cục 3 vùng (workspace+file trái · timeline phải · diff giữa),
-//! poll dữ liệu qua engine mỗi 1s, revert/label qua connection write riêng.
+//! GUI application: three-pane layout (workspace + file list on the left,
+//! timeline on the right, diff in the center). Data is polled from the engine
+//! once per second; revert/label writes go through a dedicated per-operation
+//! write connection.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -9,25 +11,25 @@ use history::{EventKind, FileSummary, LocalHistory, Version, VersionId, Workspac
 use rust_i18n::t;
 use time::{Date, OffsetDateTime, UtcOffset};
 
-use crate::diff_view::{self, DiffModel, Line};
+use crate::diff_view::{self, DiffModel, DiffSelection, Line};
 use crate::icons;
 use crate::state::{self, GuiState, LangPref};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Chế độ so sánh của diff.
+/// Which pair of contents the diff compares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffMode {
-    /// Version đang chọn ↔ version ngay trước nó.
+    /// Selected version against the version immediately before it.
     Previous,
-    /// Version đang chọn ↔ nội dung hiện tại trên disk.
+    /// Selected version against the current on-disk content.
     CurrentDisk,
-    /// Hai version bất kỳ do user chọn.
+    /// Two arbitrary versions picked by the user.
     AnyTwo,
 }
 
 impl DiffMode {
-    /// Nhãn hiển thị của chế độ so sánh (qua i18n `diff.mode_*`).
+    /// Display label for the mode, from the i18n `diff.mode_*` keys.
     fn label(self) -> String {
         match self {
             DiffMode::Previous => t!("diff.mode_prev").to_string(),
@@ -37,9 +39,9 @@ impl DiffMode {
     }
 }
 
-/// Chọn cặp version (trái, phải) cho diff. `versions` sắp mới nhất trước.
-/// `custom_left/custom_right` là lựa chọn của user trong chế độ AnyTwo;
-/// chế độ CurrentDisk trả phải = None (đánh dấu "so với disk").
+/// Resolves the (left, right) version pair to diff. `versions` is newest-first;
+/// `custom_left`/`custom_right` are the user's picks in [`DiffMode::AnyTwo`];
+/// [`DiffMode::CurrentDisk`] returns `None` on the right, meaning "against disk".
 pub fn pick_pair(
     mode: DiffMode,
     versions: &[Version],
@@ -57,7 +59,7 @@ pub fn pick_pair(
         DiffMode::CurrentDisk => (Some(sel), None),
         DiffMode::AnyTwo => {
             let left = custom_left.or(Some(sel));
-            // phải mặc định là version ngay trước trái (cũ hơn)
+            // right defaults to the version just before the left one (older)
             let right = custom_right.or_else(|| {
                 let li = left.and_then(|id| versions.iter().position(|v| v.id == id));
                 li.and_then(|i| versions.get(i + 1)).map(|v| v.id)
@@ -67,8 +69,10 @@ pub fn pick_pair(
     }
 }
 
-/// Tìm workspace chứa `file` (so sánh từng thành phần path, không phân biệt hoa thường
-/// ASCII) → (ws_id, rel_path phân tách '/'). TODO: case-fold Unicode cho path tiếng Việt.
+/// Finds the workspace containing `file` via component-wise ASCII
+/// case-insensitive prefix match and returns `(workspace_id, rel_path)` with
+/// `/` separators.
+// TODO: Unicode-aware case folding for non-ASCII path components.
 pub fn resolve_ws_and_rel(
     workspaces: &[(WorkspaceId, PathBuf)],
     file: &Path,
@@ -94,77 +98,102 @@ pub fn resolve_ws_and_rel(
     None
 }
 
-/// Thông báo hiện ở status bar (giữ lại đến khi có thông báo mới).
+/// Message shown in the status bar; kept until a newer one replaces it.
 #[derive(Debug, Clone)]
 pub struct Status {
+    /// Message body.
     pub text: String,
+    /// Success (true) or error (false) — selects the toast glyph and color.
     pub ok: bool,
 }
 
-/// Modal xác nhận revert.
+/// A revert awaiting user confirmation in the modal.
 #[derive(Debug, Clone)]
 pub struct ConfirmRevert {
+    /// Version to revert to.
     pub id: VersionId,
+    /// Sequence number of that version, for the confirmation message.
     pub seq: i64,
+    /// Workspace-relative path of the file.
     pub rel: String,
 }
 
-/// Khóa của diff đang hiển thị — đổi khóa ⇒ build lại model (load content).
+/// Identity of the displayed diff; a key change rebuilds the model (and
+/// reloads content).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffKey {
+    /// Comparison mode the pair was picked for.
     pub mode: DiffMode,
+    /// Left (old) side of the pair.
     pub left: Option<VersionId>,
-    /// None trong chế độ CurrentDisk = so với disk; None ở AnyTwo = chưa chọn đủ.
+    /// `None` in [`DiffMode::CurrentDisk`] means "against disk"; `None` in
+    /// [`DiffMode::AnyTwo`] means the pair is incomplete.
     pub right: Option<VersionId>,
-    /// Token dữ liệu (tổng version) — thay đổi ⇒ disk/cặp có thể đã đổi.
+    /// Data token (total version count); a change means the store data may
+    /// have moved under the pair.
     pub token: u64,
 }
 
+/// Cached diff model; rebuilt whenever the incoming [`DiffKey`] differs.
 #[derive(Debug)]
 pub struct CachedDiff {
+    /// Key the model was built for.
     pub key: DiffKey,
+    /// Renderable diff model.
     pub model: DiffModel,
+    /// Raw on-disk bytes the model was built against (CurrentDisk mode only).
+    /// Copying the unified diff uses THESE bytes, not a fresh read, so the
+    /// copied diff always matches what the panes are showing.
+    pub disk_bytes: Option<Vec<u8>>,
 }
 
+/// Application state: polled engine data, current selection, cached diff, and
+/// pending modal actions.
 pub struct App {
     pub store_root: PathBuf,
     pub state: GuiState,
     pub state_path: PathBuf,
-    /// Connection read-only (None = chưa mở được — màn hình chọn store).
+    /// Read-only store connection; `None` until it opens (the store picker
+    /// screen shows in the meantime).
     pub ro: Option<LocalHistory>,
     pub workspaces: Vec<(WorkspaceId, PathBuf)>,
     pub current_ws: Option<WorkspaceId>,
     pub files: Vec<FileSummary>,
-    /// rel_path ('/') của file đang chọn.
+    /// rel path (`/`-separated) of the selected file.
     pub selected_file: Option<String>,
     pub versions: Vec<Version>,
     pub selected_version: Option<VersionId>,
-    // filter timeline
+    // timeline filters
     pub kind_filter: Option<EventKind>,
     pub label_filter: String,
     pub file_search: String,
-    // diff
+    // diff state
     pub diff_mode: DiffMode,
     pub diff_left_id: Option<VersionId>,
     pub diff_right_id: Option<VersionId>,
     pub diff_cache: Option<CachedDiff>,
-    // thao tác
+    /// Click-selected diff rows (highlight + Ctrl+C raw copy). RESET whenever
+    /// the diff pair changes — see `diff_panel`.
+    pub diff_selection: DiffSelection,
+    // pending modal actions
     pub confirm_revert: Option<ConfirmRevert>,
     pub label_edit_open: bool,
     pub label_draft: String,
     pub status: Status,
     pub last_poll: Option<OffsetDateTime>,
-    /// Lần poll kế tiếp (None = poll ngay frame tới) — poll không chạy mỗi frame.
+    /// When the next poll runs (`None` = next frame); polls never run every frame.
     pub next_poll: Option<Instant>,
     pub last_token: u64,
     pub force_refresh: bool,
-    // --file
+    // --file startup target
     pub pending_file_path: Option<PathBuf>,
     pub pending_file_rel: Option<String>,
     pub pending_announced: bool,
 }
 
 impl App {
+    /// Builds the app with the engine's default store root and, when launched
+    /// with `--file`, the file whose timeline to open once its data resolves.
     pub fn new(default_root: PathBuf, initial_file: Option<PathBuf>) -> Self {
         let mut state = state::load_state(&state::state_path(&default_root));
         let store_root = state
@@ -174,7 +203,7 @@ impl App {
             .filter(|p| p.is_dir())
             .unwrap_or_else(|| default_root.clone());
         if store_root != default_root {
-            // state của store đã chọn có thể có last_ws_root cụ thể hơn
+            // the chosen store's own state may carry a more specific last_ws_root
             let st2 = state::load_state(&state::state_path(&store_root));
             if state.last_ws_root.is_none() {
                 state.last_ws_root = st2.last_ws_root;
@@ -182,8 +211,9 @@ impl App {
         }
         let state_path = state::state_path(&store_root);
         state.last_store_root = Some(store_root.to_string_lossy().to_string());
-        // Đặt locale TRƯỚC khi tạo chuỗi đầu tiên ("status.ready") — ngôn ngữ của frame
-        // đầu phải theo state; đổi sau này qua dropdown (set_lang) cũng đủ vì egui vẽ lại.
+        // Set the locale BEFORE the first string is built ("status.ready") — the
+        // first frame must honor the persisted state; later switches go through
+        // set_lang (egui repaints anyway).
         rust_i18n::set_locale(state::resolve_lang(
             LangPref::parse(state.lang.as_deref()),
             sys_locale::get_locale().as_deref(),
@@ -206,6 +236,7 @@ impl App {
             diff_left_id: None,
             diff_right_id: None,
             diff_cache: None,
+            diff_selection: DiffSelection::default(),
             confirm_revert: None,
             label_edit_open: false,
             label_draft: String::new(),
@@ -224,8 +255,8 @@ impl App {
         self.status = Status { text: text.into(), ok };
     }
 
-    /// Đổi ngôn ngữ runtime: ghi state + set_locale toàn cục (frame kế hiển thị ngôn ngữ
-    /// mới — egui vẽ lại liên tục theo poll).
+    /// Switches the UI language at runtime: persists the preference and applies
+    /// the global locale; subsequent repaints render the new language.
     fn set_lang(&mut self, pref: LangPref) {
         if self.state.lang.as_deref() == Some(pref.as_str()) {
             return;
@@ -244,7 +275,7 @@ impl App {
         }
     }
 
-    /// Đường dẫn file tuyệt đối từ ws + rel_path.
+    /// Absolute file path built from the workspace root and a `/`-separated rel path.
     fn ws_file_path(&self, ws: WorkspaceId, rel: &str) -> PathBuf {
         let root = self
             .workspaces
@@ -256,7 +287,7 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Poll dữ liệu (connection read-only)
+    // Polling (read-only connection)
     // -----------------------------------------------------------------------
 
     fn poll(&mut self) {
@@ -267,11 +298,11 @@ impl App {
                     self.ro = Some(s);
                     self.force_refresh = true;
                 }
-                Err(_) => return, // chưa có store — UI hiển thị màn hình chọn store
+                Err(_) => return, // no store yet — the store picker screen shows instead
             }
         }
 
-        // workspaces (query rẻ, gọi mỗi poll)
+        // workspaces (cheap query, runs every poll)
         if let Some(store) = self.ro.as_ref() {
             match store.workspaces() {
                 Ok(wss) => {
@@ -289,7 +320,7 @@ impl App {
             return;
         }
 
-        // --file: resolve workspace + rel_path (làm một lần)
+        // --file: resolve workspace + rel path (once)
         if let Some(file) = self.pending_file_path.take() {
             match resolve_ws_and_rel(&self.workspaces, &file) {
                 Some((id, rel)) => {
@@ -306,7 +337,7 @@ impl App {
             }
         }
 
-        // tự chọn workspace lần đầu: last_ws_root → workspace đầu tiên
+        // first-run auto-pick: last_ws_root, else the first workspace
         if self.current_ws.is_none() {
             let pick = self
                 .state
@@ -325,7 +356,7 @@ impl App {
         }
         let Some(ws) = self.current_ws else { return };
 
-        // danh sách file + token "rẻ" nhận biết dữ liệu đổi: số file + tổng version
+        // file list + a cheap change token: file count + total version count
         let files = match self.ro.as_ref().map(|s| s.list_files(ws, None)) {
             Some(Ok(f)) => f,
             Some(Err(e)) => {
@@ -347,9 +378,9 @@ impl App {
         }
     }
 
-    /// Dữ liệu vừa đổi (poll thấy token mới / force refresh).
+    /// Handles freshly changed data (a new token seen by a poll, or a forced refresh).
     fn on_data_changed(&mut self) {
-        // --file: chọn file khi nó xuất hiện trong list
+        // --file: select the file once it shows up in the list
         if let Some(rel) = self.pending_file_rel.clone() {
             if self.selected_file.as_deref() != Some(rel.as_str())
                 && self.files.iter().any(|f| f.rel_path == rel)
@@ -372,8 +403,8 @@ impl App {
         self.refresh_versions();
     }
 
-    /// Nạp lại versions của file đang chọn (KHÔNG load content — content chỉ load khi
-    /// build cặp diff).
+    /// Reloads the versions of the selected file (content is NOT loaded here —
+    /// only when a diff pair is built).
     fn refresh_versions(&mut self) {
         let Some(ws) = self.current_ws else { return };
         let Some(rel) = self.selected_file.clone() else {
@@ -399,7 +430,7 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Chuyển đổi selection / store
+    // Selection / store switches
     // -----------------------------------------------------------------------
 
     fn switch_ws(&mut self, id: WorkspaceId) {
@@ -418,7 +449,7 @@ impl App {
         }
         self.save_state();
         self.force_refresh = true;
-        self.next_poll = None; // poll ngay frame tới
+        self.next_poll = None; // poll on the next frame
     }
 
     fn switch_store(&mut self, dir: PathBuf) {
@@ -441,7 +472,7 @@ impl App {
     }
 
     // -----------------------------------------------------------------------
-    // Thao tác ghi (connection write riêng, mở từng lần)
+    // Write operations (dedicated connection, opened per operation)
     // -----------------------------------------------------------------------
 
     fn add_workspace(&mut self) {
@@ -473,7 +504,7 @@ impl App {
         match res {
             Ok(()) => {
                 self.force_refresh = true;
-                self.poll(); // nạp lại versions ngay để tìm pre_revert
+                self.poll(); // reload versions now to find the pre_revert entry
                 self.next_poll = Some(Instant::now() + POLL_INTERVAL);
                 let pre = self
                     .versions
@@ -531,7 +562,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn update_ui(&mut self, ui: &mut egui::Ui) {
-        // Thứ tự: bottom → trái → phải → CentralPanel CUỐI (quy ước egui).
+        // Order matters: bottom → left → right → CentralPanel LAST (egui convention).
         egui::Panel::bottom("lh_status").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("lh_files")
             .default_size(280.0)
@@ -595,7 +626,7 @@ impl App {
             let poll = self.last_poll.map(state::hhmm).unwrap_or_else(|| "—".into());
             ui.small(t!("status.poll", time = poll));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // dropdown ngôn ngữ — góc phải cùng, đổi runtime (ghi state + set_locale)
+                // language dropdown — runtime switch (persists state + set_locale)
                 let pref = LangPref::parse(self.state.lang.as_deref());
                 egui::ComboBox::from_id_salt("lang_combo")
                     .selected_text(match pref {
@@ -612,13 +643,13 @@ impl App {
                         ] {
                             if ui.selectable_label(pref == p, label).clicked() {
                                 self.set_lang(p);
-                                // vẽ lại ngay để mọi panel chuyển sang ngôn ngữ mới
+                                // repaint immediately so every panel switches language
                                 ui.ctx().request_repaint();
                             }
                         }
                     });
                 ui.separator();
-                // toast: icon kiểm chéo/lỗi (icon font) + text thông báo
+                // toast: check/error glyph + message text
                 let icon = if self.status.ok { icons::CHECK } else { icons::WARNING };
                 let text = egui::RichText::new(format!("{icon} {}", self.status.text)).small();
                 let text = if self.status.ok {
@@ -708,7 +739,7 @@ impl App {
             });
     }
 
-    /// Row file: rel_path + badge số version + thời gian sửa cuối.
+    /// One file row: rel path, version count and last-modified time.
     fn file_row(&self, ui: &mut egui::Ui, f: &FileSummary, selected: bool) -> egui::Response {
         let h = 34.0;
         let (rect, resp) =
@@ -744,7 +775,7 @@ impl App {
             egui::FontId::proportional(11.0),
             dim,
         );
-        // chấm màu kind mới nhất ở góc phải
+        // kind-colored dot for the latest event, top-right
         p.circle_filled(egui::pos2(rect.right() - 10.0, rect.top() + 10.0), 3.5, state::kind_color(f.last_kind));
         resp.on_hover_text(f.rel_path.as_str())
     }
@@ -762,7 +793,7 @@ impl App {
         }
         ui.add_space(2.0);
 
-        // filter kind + label
+        // kind + label filters
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(format!(
                 "{} {}",
@@ -800,7 +831,7 @@ impl App {
             );
         });
 
-        // thao tác trên version đang chọn
+        // actions on the selected version
         ui.horizontal(|ui| {
             let has_sel = self.selected_version.is_some() && self.selected_file.is_some();
             if ui
@@ -886,7 +917,7 @@ impl App {
             });
     }
 
-    /// Row version: giờ · badge kind · label · storage/size.
+    /// One version row: time · kind badge · label · storage/size.
     fn version_row(&self, ui: &mut egui::Ui, v: &Version, selected: bool) -> egui::Response {
         let h = 26.0;
         let (rect, resp) =
@@ -902,7 +933,6 @@ impl App {
         let y = rect.center().y;
         let dim = egui::Color32::from_rgb(150, 150, 150);
         let dt = state::unix_micros_to_local(v.timestamp_micros, state::local_utc_offset());
-        // giờ
         p.text(
             egui::pos2(rect.left() + 6.0, y),
             egui::Align2::LEFT_CENTER,
@@ -910,7 +940,7 @@ impl App {
             egui::FontId::monospace(12.0),
             dim,
         );
-        // badge kind (nền nhạt + chữ màu kind)
+        // kind badge (tinted background, kind-colored text)
         let kind_col = state::kind_color(v.kind);
         let galley = p.layout_no_wrap(v.kind.as_str().to_string(), egui::FontId::proportional(11.0), kind_col);
         let pad = 6.0;
@@ -925,13 +955,13 @@ impl App {
             kind_col.gamma_multiply(0.2),
         );
         p.galley(egui::pos2(bx + pad, y - galley.size().y / 2.0), galley, kind_col);
-        // label (italic, màu tím nhạt)
+        // label (italic, light purple)
         if let Some(label) = &v.label {
             let label_col = egui::Color32::from_rgb(200, 180, 240);
             let g = p.layout_no_wrap(label.clone(), egui::FontId::proportional(12.5), label_col);
             p.galley(egui::pos2(bx + bw + 8.0, y - g.size().y / 2.0), g, label_col);
         }
-        // storage + size bên phải
+        // storage + size, right-aligned
         let right = format!("{} · {}", v.storage.as_str(), state::human_size(v.size));
         p.text(
             egui::pos2(rect.right() - 6.0, y),
@@ -963,10 +993,26 @@ impl App {
             if self.diff_mode == DiffMode::AnyTwo {
                 self.any_two_pickers(ui);
             }
+            // Copy diff: the ENGINE's unified diff of the current pair;
+            // disabled with no renderable model (nothing picked yet) or binary.
+            let can_copy_diff = self
+                .diff_cache
+                .as_ref()
+                .is_some_and(|c| !c.model.binary && c.model.note.is_none());
+            if ui
+                .add_enabled(
+                    can_copy_diff,
+                    egui::Button::new(format!("{} {}", icons::COPY, t!("diff.copy"))),
+                )
+                .on_hover_text(t!("diff.copy_tip"))
+                .clicked()
+            {
+                self.copy_unified_diff(ui.ctx());
+            }
         });
         ui.separator();
 
-        // cache: build lại model khi khóa đổi (content chỉ load ở đây)
+        // cache: rebuild the model only when the key changes (content loads only here)
         let key = self.current_diff_key();
         let stale = match (&self.diff_cache, &key) {
             (None, Some(_)) => true,
@@ -974,11 +1020,71 @@ impl App {
             _ => false,
         };
         if stale {
-            self.diff_cache =
-                key.map(|k| CachedDiff { key: k, model: self.build_diff_model() });
+            // the diff pair (or its data) changed ⇒ the row selection refers to
+            // a different model — RESET it instead of carrying lines across
+            self.diff_selection = DiffSelection::default();
+            self.diff_cache = key.map(|k| {
+                // read the disk content ONCE here, for both the model and the
+                // "Copy diff" action (they must describe the same bytes)
+                let disk_bytes = if k.mode == DiffMode::CurrentDisk {
+                    self.selected_file
+                        .as_ref()
+                        .and_then(|rel| std::fs::read(self.ws_file_path(self.current_ws?, rel)).ok())
+                } else {
+                    None
+                };
+                CachedDiff { key: k, model: self.build_diff_model(disk_bytes.as_deref()), disk_bytes }
+            });
         }
-        if let Some(c) = &self.diff_cache {
-            diff_view::show_diff(ui, &c.model);
+        // split borrows: the cache is shared while the selection is mutated;
+        // `Some(n)` = the raw text of n selected lines was copied (Ctrl+C)
+        let copied = if let Some(c) = &self.diff_cache {
+            let mut sel = std::mem::take(&mut self.diff_selection);
+            let copied = diff_view::show_diff(ui, &c.model, &mut sel);
+            self.diff_selection = sel;
+            copied
+        } else {
+            None
+        };
+        if let Some(n) = copied {
+            self.set_status(t!("diff.copied", n = n).to_string(), true);
+        }
+    }
+
+    /// Copies the unified diff of the current pair straight from the ENGINE
+    /// (`diff_text` between two versions, `diff_text_content` against disk) —
+    /// never a locally regenerated diff. Errors surface as an error toast.
+    fn copy_unified_diff(&mut self, ctx: &egui::Context) {
+        let Some(cache) = &self.diff_cache else { return };
+        if cache.model.binary || cache.model.note.is_some() {
+            return; // the button is disabled in these cases; defensive
+        }
+        let (left_id, right_id) = pick_pair(
+            self.diff_mode,
+            &self.versions,
+            self.selected_version,
+            self.diff_left_id,
+            self.diff_right_id,
+        );
+        let (Some(store), Some(lid)) = (self.ro.as_ref(), left_id) else {
+            return;
+        };
+        let res = match right_id {
+            Some(rid) => store.diff_text(lid, rid).map_err(|e| e.to_string()),
+            None => {
+                // the bytes the panes were built from (empty = file deleted) —
+                // copying from the cache keeps the diff identical to what is shown
+                store
+                    .diff_text_content(&cache.disk_bytes.clone().unwrap_or_default(), lid)
+                    .map_err(|e| e.to_string())
+            }
+        };
+        match res {
+            Ok(text) => {
+                ctx.copy_text(text);
+                self.set_status(t!("diff.copied_diff").to_string(), true);
+            }
+            Err(e) => self.set_status(t!("err.diff", e = e).to_string(), false),
         }
     }
 
@@ -1029,9 +1135,11 @@ impl App {
         Some(DiffKey { mode: self.diff_mode, left, right, token: self.last_token })
     }
 
-    /// Build model diff cho cặp hiện tại: content trái/phải + hunks → 2 mảng dòng.
-    /// Content CHỈ load ở đây — một cặp tại một thời điểm.
-    fn build_diff_model(&self) -> DiffModel {
+    /// Builds the diff model for the current pair: left/right content + hunks →
+    /// two line arrays. Content is loaded ONLY here — one pair at a time.
+    /// `disk_bytes` (CurrentDisk mode) is the already-read disk content: `None`
+    /// means the file is missing or the mode doesn't need it.
+    fn build_diff_model(&self, disk_bytes: Option<&[u8]>) -> DiffModel {
         let (left_id, right_id) = pick_pair(
             self.diff_mode,
             &self.versions,
@@ -1039,7 +1147,7 @@ impl App {
             self.diff_left_id,
             self.diff_right_id,
         );
-        let Some(ws) = self.current_ws else {
+        if self.current_ws.is_none() {
             return DiffModel::empty_note(t!("diff.no_ws"));
         };
         let Some(lid) = left_id else {
@@ -1056,7 +1164,7 @@ impl App {
             return DiffModel::empty_note(t!("diff.version_gone"));
         };
 
-        // content trái
+        // left content
         let left_bytes = match store.content(lid) {
             Ok(b) => b,
             Err(e) => return DiffModel::empty_note(t!("err.content", e = e)),
@@ -1065,7 +1173,7 @@ impl App {
             Ok(t) => t,
             Err(_) => return DiffModel::binary_note(),
         };
-        let left_title = version_title(&left_v);
+        let ver_title = version_title(&left_v);
 
         match right_id {
             Some(rid) => {
@@ -1082,13 +1190,13 @@ impl App {
                 };
                 match store.diff_lines(lid, rid) {
                     Ok(hunks) => {
-                        // old = trái (version đang chọn), new = phải
+                        // old = left (the selected version), new = right
                         let base = state::split_lines(&left_text);
                         let target = state::split_lines(&right_text);
                         let (l, r) = diff_view::apply_hunks_to_sides(&base, &target, &hunks);
-                        DiffModel {
-                            left_title,
-                            right_title: version_title(&right_v),
+                                DiffModel {
+                                    left_title: ver_title,
+                                    right_title: version_title(&right_v),
                             left: l,
                             right: r,
                             binary: false,
@@ -1102,65 +1210,65 @@ impl App {
                 }
             }
             None => {
-                // so với disk hiện tại: trái = version, phải = disk
-                let Some(rel) = self.selected_file.clone() else {
+                // against current disk: left = disk (the old side of the engine's
+                // `diff_*_content(disk, version)` diff), right = version (the new
+                // side) — same old→new pane order as the two-versions mode, so a
+                // copied diff's `-` lines are the left pane and `+` lines the right
+                if self.selected_file.is_none() {
                     return DiffModel::empty_note(t!("diff.no_file"));
+                }
+                let Some(disk_bytes) = disk_bytes else {
+                    // read failed or no file — same as the deleted-file case: the
+                    // disk side is empty, the version's content still shows right
+                    let ver_lines: Vec<Line> = state::split_lines(&left_text)
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, t)| Line { text: t.to_string(), no: Some(i + 1), del: false, add: false })
+                        .collect();
+                    return DiffModel {
+                        left_title: t!("diff.disk_title").to_string(),
+                        right_title: ver_title,
+                        left: Vec::new(),
+                        right: ver_lines,
+                        binary: false,
+                        note: Some(t!("diff.file_missing").to_string()),
+                        identical: false,
+                        max_chars: 0,
+                    }
+                    .finished();
                 };
-                let path = self.ws_file_path(ws, &rel);
-                match std::fs::read(&path) {
-                    Err(_) => {
-                        // file đã bị xóa — vẫn hiển thị nội dung version bên trái
-                        let left_lines: Vec<Line> = state::split_lines(&left_text)
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, t)| Line { text: t.to_string(), no: Some(i + 1), del: false, add: false })
-                            .collect();
+                let disk_text = match String::from_utf8(disk_bytes.to_vec()) {
+                    Ok(t) => t,
+                    Err(_) => return DiffModel::binary_note(),
+                };
+                match store.diff_lines_content(disk_text.as_bytes(), lid) {
+                    Ok(hunks) => {
+                        // old = disk (left pane), new = version (right pane):
+                        // panes follow the engine diff's old→new order, like the
+                        // two-versions mode (`-` lines = left, `+` = right)
+                        let disk_lines = state::split_lines(&disk_text);
+                        let ver_lines = state::split_lines(&left_text);
+                        let (old_side, new_side) =
+                            diff_view::apply_hunks_to_sides(&disk_lines, &ver_lines, &hunks);
                         DiffModel {
-                            left_title,
-                            right_title: t!("diff.disk_title").to_string(),
-                            left: left_lines,
-                            right: Vec::new(),
+                            left_title: t!("diff.disk_title").to_string(),
+                            right_title: ver_title,
+                            left: old_side,
+                            right: new_side,
                             binary: false,
-                            note: Some(t!("diff.file_missing").to_string()),
-                            identical: false,
+                            note: None,
+                            identical: hunks.is_empty(),
                             max_chars: 0,
                         }
                         .finished()
                     }
-                    Ok(disk_bytes) => {
-                        let disk_text = match String::from_utf8(disk_bytes) {
-                            Ok(t) => t,
-                            Err(_) => return DiffModel::binary_note(),
-                        };
-                        match store.diff_lines_content(disk_text.as_bytes(), lid) {
-                            Ok(hunks) => {
-                                // old = disk, new = version ⇒ trái = new side, phải = old side
-                                let disk_lines = state::split_lines(&disk_text);
-                                let ver_lines = state::split_lines(&left_text);
-                                let (old_side, new_side) =
-                                    diff_view::apply_hunks_to_sides(&disk_lines, &ver_lines, &hunks);
-                                DiffModel {
-                                    left_title,
-                                    right_title: t!("diff.disk_title").to_string(),
-                                    left: new_side,
-                                    right: old_side,
-                                    binary: false,
-                                    note: None,
-                                    identical: hunks.is_empty(),
-                                    max_chars: 0,
-                                }
-                                .finished()
-                            }
-                            Err(e) => DiffModel::empty_note(t!("err.diff", e = e)),
-                        }
-                    }
+                    Err(e) => DiffModel::empty_note(t!("err.diff", e = e)),
                 }
             }
         }
     }
 
     fn show_modals(&mut self, ctx: &egui::Context) {
-        // Modal xác nhận revert
         if let Some(c) = self.confirm_revert.clone() {
             let modal = egui::Modal::new(egui::Id::unique("confirm_revert"));
             let resp = modal.show(ctx, |ui| {
@@ -1192,7 +1300,6 @@ impl App {
             }
         }
 
-        // Modal gắn nhãn
         if self.label_edit_open {
             let modal = egui::Modal::new(egui::Id::unique("label_edit"));
             let resp = modal.show(ctx, |ui| {
@@ -1229,7 +1336,7 @@ impl App {
     }
 }
 
-/// Tiêu đề pane: "seq N · kind · HH:MM".
+/// Pane title for a version: `seq N · kind · HH:MM`.
 fn version_title(v: &Version) -> String {
     let dt = state::unix_micros_to_local(v.timestamp_micros, state::local_utc_offset());
     format!("seq {} · {} · {}", v.seq, v.kind.as_str(), state::hhmm(dt))
@@ -1237,7 +1344,7 @@ fn version_title(v: &Version) -> String {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // poll mỗi POLL_INTERVAL (không poll mỗi frame) — force op đặt next_poll = None
+        // poll every POLL_INTERVAL (not every frame); forced ops set next_poll = None
         match self.next_poll {
             Some(t) if Instant::now() < t => {}
             _ => {
@@ -1255,7 +1362,7 @@ impl eframe::App for App {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — logic chọn cặp + resolve workspace (phần thuần của app)
+// Tests — pair selection + workspace resolution (the pure part of app)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1281,22 +1388,22 @@ mod tests {
     #[test]
     fn pick_pair_previous_mode() {
         let versions = vec![ver(30, 3), ver(20, 2), ver(10, 1)];
-        // giữa chain: "version trước" = version cũ hơn ngay sau nó
+        // mid-chain: "previous" = the older version right after it
         assert_eq!(
             pick_pair(DiffMode::Previous, &versions, Some(20), None, None),
             (Some(20), Some(10))
         );
-        // mới nhất: trước = version thứ 2
+        // newest: previous = the second version
         assert_eq!(
             pick_pair(DiffMode::Previous, &versions, Some(30), None, None),
             (Some(30), Some(20))
         );
-        // version đầu tiên: không có version trước
+        // first version: nothing before it
         assert_eq!(
             pick_pair(DiffMode::Previous, &versions, Some(10), None, None),
             (Some(10), None)
         );
-        // chưa chọn gì
+        // nothing selected
         assert_eq!(
             pick_pair(DiffMode::Previous, &versions, None, None, None),
             (None, None)
@@ -1306,17 +1413,17 @@ mod tests {
     #[test]
     fn pick_pair_disk_and_anytwo() {
         let versions = vec![ver(30, 3), ver(20, 2), ver(10, 1)];
-        // disk: phải = None (đánh dấu so với disk)
+        // CurrentDisk: right = None (marks "against disk")
         assert_eq!(
             pick_pair(DiffMode::CurrentDisk, &versions, Some(20), None, None),
             (Some(20), None)
         );
-        // AnyTwo dùng lựa chọn của user
+        // AnyTwo honors the user's picks
         assert_eq!(
             pick_pair(DiffMode::AnyTwo, &versions, Some(20), Some(30), Some(10)),
             (Some(30), Some(10))
         );
-        // AnyTwo: trái mặc định = version đang chọn, phải mặc định = version trước nó
+        // AnyTwo: left defaults to the selected version, right to the version before it
         assert_eq!(
             pick_pair(DiffMode::AnyTwo, &versions, Some(30), None, None),
             (Some(30), Some(20))
@@ -1331,14 +1438,14 @@ mod tests {
             resolve_ws_and_rel(&ws, f),
             Some((1, "src/main.rs".to_string()))
         );
-        // không phân biệt hoa thường (ASCII)
+        // ASCII case-insensitive
         let f2 = Path::new(r"d:\PROJ\A.txt");
         assert_eq!(resolve_ws_and_rel(&ws, f2), Some((1, "A.txt".to_string())));
-        // file ngoài ws → None
+        // file outside the workspace → None
         assert_eq!(resolve_ws_and_rel(&ws, Path::new(r"D:\other\a.rs")), None);
-        // chính ws root → None (phải nằm BÊN TRONG)
+        // the workspace root itself → None (must be strictly inside)
         assert_eq!(resolve_ws_and_rel(&ws, Path::new(r"D:\proj")), None);
-        // prefix trùng tên nhưng là thư mục khác (D:\project ≠ D:\proj)
+        // same-name prefix but a different directory (D:\project ≠ D:\proj)
         assert_eq!(
             resolve_ws_and_rel(&ws, Path::new(r"D:\project\a.rs")),
             None

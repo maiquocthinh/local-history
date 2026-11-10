@@ -1,14 +1,14 @@
-﻿# Smoke end-to-end cho local-history M3 (daemon + CLI).
-# Chạy: powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1
-# Bước: build -> temp store/ws -> daemon nền -> tạo/sửa file 3 lần -> history -> diff ->
-#       show -> revert -> gc --dry-run -> dọn dẹp.
-# Mỗi bước in PASS/FAIL; exit 0 khi tất cả pass, ngược lại in bước fail + exit 1.
+﻿# End-to-end smoke test for local-history M3 (daemon + CLI).
+# Run: powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1
+# Steps: build -> temp store/ws -> background daemon -> create/edit file 3x -> history -> diff ->
+#        show -> revert -> gc --dry-run -> cleanup.
+# Each step prints PASS/FAIL; exit 0 when all pass, otherwise prints the failed step + exit 1.
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
-# env build/toolchain (shell mới không giữ env cũ — set lại như hướng dẫn dự án)
+# build/toolchain env (a fresh shell does not keep previous env — set again per project guide)
 $env:CARGO_HOME  = "C:\Users\maiquocthinh\scoop\persist\rustup-msvc\.cargo"
 $env:RUSTUP_HOME = "C:\Users\maiquocthinh\scoop\persist\rustup-msvc\.rustup"
 $env:PATH = "$env:PATH;C:\Users\maiquocthinh\scoop\persist\rustup-msvc\.cargo\bin"
@@ -40,7 +40,7 @@ if (-not (Test-Path $cliExe) -or -not (Test-Path $daemonExe)) {
 }
 Step-Pass "build cli+daemon"
 
-# ---- [2/9] temp store + temp workspace (qua env LOCAL_HISTORY_DIR) ----
+# ---- [2/9] temp store + temp workspace (via env LOCAL_HISTORY_DIR) ----
 Write-Host "== [2/9] tạo temp store + workspace =="
 $tmp = [IO.Path]::GetTempPath()
 $storeDir = Join-Path $tmp ("lh-smoke-store-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
@@ -53,7 +53,7 @@ Step-Pass "temp dirs + $env:LOCAL_HISTORY_DIR"
 
 $daemon = $null
 try {
-    # ---- [3/9] start daemon nền ----
+    # ---- [3/9] start background daemon ----
     Write-Host "== [3/9] start lh-daemon (nền) =="
     $daemon = Start-Process -FilePath $daemonExe -ArgumentList @("--dir", "`"$wsDir`"") -PassThru -WindowStyle Hidden
     $statusFile = Join-Path $storeDir "daemon.json"
@@ -61,7 +61,7 @@ try {
     while (-not (Test-Path $statusFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
     Check "daemon nền chạy (daemon.json xuất hiện)" ((Test-Path $statusFile) -and (-not $daemon.HasExited)) ("pid=" + $daemon.Id)
 
-    # ---- [4/9] tạo + sửa file 3 lần (debounce 400ms -> sleep đủ giữa các lần) ----
+    # ---- [4/9] create + edit file 3 times (debounce 400ms -> sleep long enough between writes) ----
     Write-Host "== [4/9] tạo + sửa file 3 lần =="
     $file = Join-Path $wsDir "notes.txt"
     $v1 = "dong 1"
@@ -87,7 +87,7 @@ try {
     Check "lh history (bảng) exit 0" ($LASTEXITCODE -eq 0) ("exit " + $LASTEXITCODE)
     Check "bảng có kind=external" (($human -join "`n") -match "external")
 
-    # status + workspaces (e2e cho pid_alive qua tasklist + liệt kê ws qua engine)
+    # status + workspaces (e2e for pid_alive via tasklist + workspace listing via the engine)
     $stJson = & $cliExe --json status
     if ($LASTEXITCODE -ne 0) {
         Step-Fail "lh status --json" ("exit " + $LASTEXITCODE)
@@ -111,7 +111,7 @@ try {
     $diffOk = ($LASTEXITCODE -eq 0) -and ($diffText -like "*@@*") -and ($diffText -like "*+dong 1 doi*")
     Check "diff seq 1..3 có unified diff (+/-)" $diffOk ("exit=" + $LASTEXITCODE + " out=" + $diffText)
 
-    # ---- [7/9] lh show --at 1 (và latest) ----
+    # ---- [7/9] lh show --at 1 (and latest) ----
     Write-Host "== [7/9] lh show =="
     $showOut = (& $cliExe show $file --at 1) -join "`n"
     Check "show --at 1 khớp nội dung lần ghi đầu" ($LASTEXITCODE -eq 0 -and $showOut.Trim() -ceq $v1) ("exit=" + $LASTEXITCODE + " nhận='" + $showOut + "'")
@@ -135,7 +135,7 @@ try {
     Write-Host "== dọn dẹp =="
     if ($daemon -and -not $daemon.HasExited) {
         Stop-Process -Id $daemon.Id -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 300   # chờ nhả lock trước khi xóa tempdir
+        Start-Sleep -Milliseconds 300   # wait for the lock release before deleting temp dirs
     }
     foreach ($d in @($storeDir, $wsDir)) {
         if ($d -and (Test-Path $d)) { Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue }

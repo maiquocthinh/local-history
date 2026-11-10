@@ -1,5 +1,5 @@
-//! Integration test cho chuỗi version: record 40 lần sửa ngẫu nhiên → reconstruct khớp,
-//! dedup, chính sách full/delta, delete marker, revert flow, label, diff.
+//! Integration tests for the version chain: 40 random edits recorded and reconstructed,
+//! dedup, the full/delta policy, delete markers, the revert flow, labels, diff.
 
 use std::fs;
 
@@ -12,7 +12,7 @@ fn setup() -> (tempfile::TempDir, WorkspaceId, LocalHistory) {
     (dir, ws, store)
 }
 
-/// LCG cố định (không thêm dep rand): seed giống nhau → chuỗi test deterministic.
+/// Fixed LCG (no rand dependency): the same seed keeps the tests deterministic.
 struct Lcg(u64);
 
 impl Lcg {
@@ -28,7 +28,8 @@ impl Lcg {
     }
 }
 
-/// Nội dung text ngẫu nhiên gồm `lines` dòng, mang `salt` để luôn khác nội dung trước đó.
+/// Random text of `lines` lines carrying `salt`, so the content always differs from the
+/// previous one.
 fn text_of_lines(rng: &mut Lcg, lines: usize, salt: u32) -> Vec<u8> {
     let mut s = String::new();
     for i in 0..lines {
@@ -41,7 +42,8 @@ fn text_of_lines(rng: &mut Lcg, lines: usize, salt: u32) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// Sửa nhỏ 1-3 dòng ngẫu nhiên; dòng mới mang token `salt` duy nhất → luôn đổi nội dung.
+/// Edits 1-3 random lines; the new lines carry a unique `salt` token, so the content always
+/// changes.
 fn edit_lines(rng: &mut Lcg, content: Vec<u8>, salt: u32) -> Vec<u8> {
     let text = String::from_utf8(content).unwrap();
     let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
@@ -56,7 +58,8 @@ fn edit_lines(rng: &mut Lcg, content: Vec<u8>, salt: u32) -> Vec<u8> {
     lines.concat().into_bytes()
 }
 
-/// 40 lần sửa ngẫu nhiên → mọi version (kể cả giữa chain delta) tái tạo đúng nội dung gốc.
+/// 40 random edits → every version (including mid-delta-chain) reconstructs to the exact
+/// original content.
 #[test]
 fn roundtrip_40_edits() {
     let (_dir, ws, store) = setup();
@@ -67,7 +70,7 @@ fn roundtrip_40_edits() {
     let mut expected: Vec<Vec<u8>> = Vec::new();
     let mut ids: Vec<i64> = Vec::new();
     for i in 0..40u32 {
-        // Đôi lần thay cả file, còn lại sửa nhỏ vài dòng
+        // occasionally replace the whole file; otherwise edit a few lines
         content = if i % 9 == 4 {
             let lines = 3 + rng.below(30) as usize;
             text_of_lines(&mut rng, lines, i)
@@ -84,14 +87,14 @@ fn roundtrip_40_edits() {
 
     assert_eq!(expected.len(), 40);
     assert_eq!(ids.len(), 40);
-    // Mọi version tái tạo đúng nội dung (chẵn/lẻ/giữa đều nằm trong vòng lặp)
+    // every version reconstructs exactly (fulls, deltas, and mid-chain)
     for (k, id) in ids.iter().enumerate() {
         assert_eq!(store.content(*id).unwrap(), expected[k], "version {k} (id {id}) sai nội dung");
     }
     let last = *ids.last().unwrap();
     assert_eq!(store.content(last).unwrap(), expected[39]);
 
-    // history() đủ 40 version, seq giảm dần, thứ tự khớp ids
+    // history() has all 40 versions, seq strictly decreasing, order matching ids
     let hist = store.history(ws, &file).unwrap();
     assert_eq!(hist.len(), 40);
     for w in hist.windows(2) {
@@ -104,7 +107,8 @@ fn roundtrip_40_edits() {
     }
 }
 
-/// Record 2 lần cùng nội dung + cùng kind → lần 2 Ok(None), số version không đổi.
+/// Recording the same content + kind twice → the second call is Ok(None) and the version
+/// count is unchanged.
 #[test]
 fn dedup() {
     let (_dir, ws, store) = setup();
@@ -122,14 +126,14 @@ fn dedup() {
     assert_eq!(hist[0].id, id1);
 }
 
-/// Chính sách full/delta + binary detection.
+/// Full/delta policy + binary detection.
 #[test]
 fn full_delta_policy() {
     let (_dir, ws, store) = setup();
     let file = _dir.path().join("big.txt");
     let mut rng = Lcg(42);
 
-    // File lớn ~200KB, sửa nhỏ lẻ → các version giữa chain là Delta.
+    // A large (~200 KB) file with small edits → mid-chain versions are deltas.
     let mut content = text_of_lines(&mut rng, 7500, 0);
     let mut ids = Vec::new();
     for i in 0..25u32 {
@@ -148,11 +152,11 @@ fn full_delta_policy() {
     for v in &asc[1..21] {
         assert_eq!(v.storage, Storage::Delta, "seq {} phải là delta", v.seq);
     }
-    // 20 delta liên tiếp → full xuất hiện ở GIỮA chain, rồi chain delta bắt đầu lại
+    // 20 consecutive deltas force a full mid-chain; the delta chain then restarts
     assert_eq!(asc[21].storage, Storage::Full, "chain 20 delta → full ở giữa");
     assert_eq!(asc[22].storage, Storage::Delta);
 
-    // Nội dung có NUL trong 8KB đầu → full. Nội dung invalid UTF-8 → full.
+    // NUL in the first 8 KiB → full. Invalid UTF-8 → full.
     let bfile = _dir.path().join("bin.dat");
     store
         .record(ws, &bfile, b"plain text\n", EventKind::External, None)
@@ -176,12 +180,13 @@ fn full_delta_policy() {
             .find(|v| v.id == id)
             .unwrap();
         assert_eq!(v.storage, Storage::Full, "binary phải lưu full (id {id})");
-        // Nội dung binary vẫn version đầy đủ, reconstruct được
+        // binary content is still fully versioned and reconstructable
         assert_eq!(store.content(id).unwrap(), *want);
     }
 }
 
-/// Delete marker: nội dung rỗng, version trước còn nguyên, chain tiếp tục bình thường.
+/// Delete marker: empty content, the previous version stays intact, the chain continues
+/// normally.
 #[test]
 fn delete_marker() {
     let (_dir, ws, store) = setup();
@@ -194,12 +199,12 @@ fn delete_marker() {
 
     let id_del = store.record(ws, &file, &[], EventKind::Delete, None).unwrap().unwrap();
     assert_eq!(store.content(id_del).unwrap(), b"".to_vec());
-    // Version trước marker vẫn giữ nguyên nội dung
+    // the version before the marker keeps its content
     assert_eq!(store.content(id1).unwrap(), c1);
-    // Delete liên tiếp → dedup
+    // consecutive Deletes dedup
     assert!(store.record(ws, &file, &[], EventKind::Delete, None).unwrap().is_none());
 
-    // Ghi lại nội dung 2 → chain tiếp tục
+    // writing new content continues the chain
     let c2 = b"version hai\nsau khi khoi phuc\n".to_vec();
     let id2 = store
         .record(ws, &file, &c2, EventKind::External, None)
@@ -214,8 +219,8 @@ fn delete_marker() {
     assert_eq!(hist[2].kind, EventKind::External);
 }
 
-/// Revert: sinh `pre_revert` trước khi ghi đè, `restore` sau đó; revert lại khi disk đã
-/// trùng target không tạo version mới.
+/// Revert emits `pre_revert` before overwriting and `restore` after; reverting again when
+/// disk already matches the target creates no new version.
 #[test]
 fn revert_flow() {
     let (_dir, ws, store) = setup();
@@ -241,19 +246,20 @@ fn revert_flow() {
     assert!(id2 < pre.id && pre.id < res.id);
     assert_eq!(hist[0].id, res.id, "version mới nhất là restore");
 
-    // Revert lần nữa khi disk đã == target → Ok, KHÔNG tạo version mới
+    // reverting again when disk == target → Ok, NO new version
     let before = store.history(ws, &file).unwrap().len();
     store.revert(ws, &file, id1).unwrap();
     assert_eq!(store.history(ws, &file).unwrap().len(), before);
 
-    // Version của file khác → NotFound
+    // a version of another file → NotFound
     let other = _dir.path().join("other.txt");
     fs::write(&other, b"other\n").unwrap();
     let oid = store.record(ws, &other, b"other\n", EventKind::External, None).unwrap().unwrap();
     assert!(matches!(store.revert(ws, &file, oid), Err(Error::NotFound(_))));
 }
 
-/// Label: add_label tạo version kind=Label; set_label đổi label version cũ; history phản ánh.
+/// add_label creates a version of kind Label; set_label edits the label of an old version;
+/// history reflects both.
 #[test]
 fn labels() {
     let (_dir, ws, store) = setup();
@@ -272,7 +278,7 @@ fn labels() {
     assert_eq!(lv.label.as_deref(), Some("before tests"));
     assert_eq!(store.content(id_label).unwrap(), b"noi dung\n".to_vec());
 
-    // set_label đổi label của version cũ, không tạo version mới
+    // set_label edits the label of an old version without creating a new one
     store.set_label(id_ext, Some("renamed-old")).unwrap();
     let hist = store.history(ws, &file).unwrap();
     assert_eq!(hist.len(), 2);
@@ -280,17 +286,17 @@ fn labels() {
         hist.iter().find(|v| v.id == id_ext).unwrap().label.as_deref(),
         Some("renamed-old")
     );
-    // clear label
     store.set_label(id_label, None).unwrap();
     let hist = store.history(ws, &file).unwrap();
     assert_eq!(hist.iter().find(|v| v.id == id_label).unwrap().label, None);
 
-    // Version lạ → NotFound; file không có trên disk → lỗi
+    // unknown version → NotFound; a file missing on disk → error
     assert!(matches!(store.set_label(987_654, Some("x")), Err(Error::NotFound(_))));
     assert!(store.add_label(ws, &_dir.path().join("missing.txt"), "x").is_err());
 }
 
-/// Áp hunks lên base bằng splice đúng ngữ nghĩa `model::Hunk` (dùng chỉ bằng API public).
+/// Applies hunks to base with the exact splice semantics of `model::Hunk`
+/// (using only the public API).
 fn apply_hunks_locally(base: &[u8], hunks: &[Hunk]) -> Vec<u8> {
     let mut lines: Vec<&[u8]> = Vec::new();
     let mut start = 0usize;
@@ -319,7 +325,7 @@ fn apply_hunks_locally(base: &[u8], hunks: &[Hunk]) -> Vec<u8> {
     out
 }
 
-/// Diff text/hunks giữa 2 version và so với nội dung disk hiện tại.
+/// Text/hunk diffs between two versions and against the current disk content.
 #[test]
 fn diff_version_and_content() {
     let (_dir, ws, store) = setup();
@@ -331,22 +337,22 @@ fn diff_version_and_content() {
     fs::write(&file, &newc).unwrap();
     let b = store.record(ws, &file, &newc, EventKind::External, None).unwrap().unwrap();
 
-    // Unified diff: header + dòng -/+ đúng
+    // unified diff: header and the -/+ lines
     let text = store.diff_text(a, b).unwrap();
     assert!(text.contains(&format!("--- version {a}")), "header ---: {text}");
     assert!(text.contains(&format!("+++ version {b}")), "header +++: {text}");
     assert!(text.contains("-l5\n"), "thiếu dòng -l5: {text}");
     assert!(text.contains("+X5\n"), "thiếu dòng +X5: {text}");
 
-    // Hunks áp lên nội dung a phải ra nội dung b
+    // hunks applied to content a must yield content b
     let hunks = store.diff_lines(a, b).unwrap();
     assert!(!hunks.is_empty());
     assert_eq!(apply_hunks_locally(&old, &hunks), newc);
-    // Không khác gì → rỗng
+    // no difference → empty
     assert!(store.diff_lines(a, a).unwrap().is_empty());
     assert_eq!(store.diff_text(a, a).unwrap(), "");
 
-    // So nội dung disk hiện tại với version
+    // disk content vs a version
     let disk_hunks = store.diff_lines_content(&newc, b).unwrap();
     assert!(disk_hunks.is_empty(), "disk == version b → không hunk");
     assert_eq!(store.diff_text_content(&newc, b).unwrap(), "");
@@ -355,7 +361,7 @@ fn diff_version_and_content() {
     let older_text = store.diff_text_content(&old, b).unwrap();
     assert!(older_text.contains("+X5\n"));
 
-    // Version binary (invalid UTF-8) → BinaryContent(id) tương ứng
+    // binary version (invalid UTF-8) → BinaryContent with that version's id
     let bin = b"\xff\xfe binary \xc3\x28\n".to_vec();
     let c = store.record(ws, &file, &bin, EventKind::External, None).unwrap().unwrap();
     assert!(matches!(store.diff_text(a, c), Err(Error::BinaryContent(id)) if id == c));
@@ -363,7 +369,7 @@ fn diff_version_and_content() {
         store.diff_text_content(b"\xff\xfe bad\n", b),
         Err(Error::BinaryContent(-1))
     ));
-    // NUL trong nội dung vẫn là UTF-8 hợp lệ → diff được (record lưu full nhưng không cản diff)
+    // NUL is still valid UTF-8 → diffable (record stores it full, but diffing still works)
     let nul = b"bin\0ary\n".to_vec();
     let n = store.record(ws, &file, &nul, EventKind::External, None).unwrap().unwrap();
     assert!(!store.diff_lines(a, n).unwrap().is_empty());
