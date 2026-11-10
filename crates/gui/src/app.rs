@@ -11,7 +11,7 @@ use history::{EventKind, FileSummary, LocalHistory, Version, VersionId, Workspac
 use rust_i18n::t;
 use time::{Date, OffsetDateTime, UtcOffset};
 
-use crate::diff_view::{self, DiffModel, DiffSelection, Line};
+use crate::diff_view::{self, DiffModel, Line, TextSelection};
 use crate::icons;
 use crate::state::{self, GuiState, LangPref};
 
@@ -172,9 +172,9 @@ pub struct App {
     pub diff_left_id: Option<VersionId>,
     pub diff_right_id: Option<VersionId>,
     pub diff_cache: Option<CachedDiff>,
-    /// Click-selected diff rows (highlight + Ctrl+C raw copy). RESET whenever
-    /// the diff pair changes — see `diff_panel`.
-    pub diff_selection: DiffSelection,
+    /// Character-level diff selection (drag / shift+click highlight + Ctrl+C
+    /// raw copy). RESET whenever the diff pair changes — see `diff_panel`.
+    pub diff_selection: TextSelection,
     // pending modal actions
     pub confirm_revert: Option<ConfirmRevert>,
     pub label_edit_open: bool,
@@ -236,7 +236,7 @@ impl App {
             diff_left_id: None,
             diff_right_id: None,
             diff_cache: None,
-            diff_selection: DiffSelection::default(),
+            diff_selection: TextSelection::default(),
             confirm_revert: None,
             label_edit_open: false,
             label_draft: String::new(),
@@ -1020,9 +1020,9 @@ impl App {
             _ => false,
         };
         if stale {
-            // the diff pair (or its data) changed ⇒ the row selection refers to
-            // a different model — RESET it instead of carrying lines across
-            self.diff_selection = DiffSelection::default();
+            // the diff pair (or its data) changed ⇒ the caret selection refers
+            // to a different model — RESET it instead of carrying carets across
+            self.diff_selection.reset();
             self.diff_cache = key.map(|k| {
                 // read the disk content ONCE here, for both the model and the
                 // "Copy diff" action (they must describe the same bytes)
@@ -1037,7 +1037,8 @@ impl App {
             });
         }
         // split borrows: the cache is shared while the selection is mutated;
-        // `Some(n)` = the raw text of n selected lines was copied (Ctrl+C)
+        // `Some(n)` = the raw text of n non-empty selected cells was copied
+        // (Ctrl+C)
         let copied = if let Some(c) = &self.diff_cache {
             let mut sel = std::mem::take(&mut self.diff_selection);
             let copied = diff_view::show_diff(ui, &c.model, &mut sel);

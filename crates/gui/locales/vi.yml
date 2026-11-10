@@ -55,7 +55,7 @@ diff:
   file_missing: "File không còn trên disk (đã bị xóa?)."
   copy: "Sao chép diff"
   copy_tip: "Copy unified diff của cặp so sánh này vào clipboard"
-  copied: "Đã copy %{n} dòng vào clipboard"
+  copied: "đã copy %{n} đoạn"
   copied_diff: "Đã copy unified diff vào clipboard"
 store:
   missing_title: "Chưa có store local-history"

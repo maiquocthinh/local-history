@@ -2,8 +2,6 @@
 //! hunks and renders them side by side (a single `ScrollArea::show_rows` keeps
 //! both panes' scrolling in sync).
 
-use std::collections::BTreeSet;
-
 use eframe::egui;
 use history::Hunk;
 use rust_i18n::t;
@@ -179,13 +177,11 @@ impl DiffModel {
 }
 
 // ---------------------------------------------------------------------------
-// Line selection (click / ctrl+click / shift+click) + raw-text copy
+// Character-level selection (drag / shift+click, editor style) + raw-text copy
 // ---------------------------------------------------------------------------
 
-// ponytail: no drag-select of text WITHIN a diff line (char-level selection) — selection is line-level only.
-
-/// Which pane a selected diff line belongs to. Enum order = display order of
-/// the panes (the left cell is drawn before the right cell of a row).
+/// Which pane a caret belongs to. Enum order = display order of the panes (the
+/// left cell is drawn before the right cell of a row).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Pane {
     /// Old side (left cell of a diff row).
@@ -194,117 +190,203 @@ pub enum Pane {
     Right,
 }
 
-/// One selected diff line. Field order defines the sort order: `row` FIRST ⇒ a
-/// `BTreeSet<SelLine>` iterates in DISPLAY order (row-major, left before
-/// right) — exactly the order copied text uses. Do not swap the fields.
+/// A caret position inside the diff grid: which pane, which row, which char
+/// column. Field order defines the display order (row-major, left before
+/// right, columns last) — `Ord` on `CaretPos` is exactly the order the
+/// highlight and copied text follow. Do not swap the fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SelLine {
+pub struct CaretPos {
     /// Row index in the diff grid (both panes share the same row indexes).
     pub row: usize,
-    /// Pane the line was clicked in.
+    /// Pane the caret is in.
     pub pane: Pane,
+    /// Char column within the line, `0..=len` (terminator stripped; it may
+    /// rest one past the last char = the end-of-line caret).
+    pub col: usize,
 }
 
-/// Line-level selection of the diff view: the highlighted rows plus the anchor
-/// for shift+click ranges. Reset to empty whenever the diff pair changes
-/// (`app::diff_panel` does this when its cached diff key goes stale); rows left
-/// over from an older, longer pair are also tolerated at copy time (skipped,
-/// never panic).
+/// Character-level selection of the diff view, working like a text editor: an
+/// anchor (where the drag started / the shift+click origin) and a cursor (the
+/// moving end). Reset whenever the diff pair changes (`app::diff_panel` does
+/// this when its cached diff key goes stale); carets left over from an older,
+/// larger pair are tolerated at paint/copy time (clamped or skipped, never
+/// panic).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DiffSelection {
-    /// Selected lines, iterated in display order regardless of click order.
-    pub lines: BTreeSet<SelLine>,
-    /// Last plain/ctrl-clicked line; the fixed origin of shift+click ranges
-    /// (shift+click does NOT move it, so repeated shift+clicks keep extending
-    /// from the same origin).
-    pub anchor: Option<SelLine>,
+pub struct TextSelection {
+    /// Selection origin (drag start / shift+click origin); `None` = unset.
+    pub anchor: Option<CaretPos>,
+    /// The other end (current drag position / plain-click caret).
+    pub cursor: Option<CaretPos>,
 }
 
-impl DiffSelection {
-    /// Whether the given cell is selected.
-    pub fn contains(&self, pane: Pane, row: usize) -> bool {
-        self.lines.contains(&SelLine { row, pane })
+impl TextSelection {
+    /// Whether nothing is visibly selected: either end unset, or anchor and
+    /// cursor collapsed onto the same caret (a plain click).
+    pub fn is_empty(&self) -> bool {
+        match (self.anchor, self.cursor) {
+            (Some(a), Some(c)) => a == c,
+            _ => true,
+        }
+    }
+
+    /// The two carets in display order (`(from, to)`), or `None` when either
+    /// end is unset. A backwards drag (anchor > cursor) is swapped here, so
+    /// paint and copy never care about the drag direction.
+    pub fn normalized(&self) -> Option<(CaretPos, CaretPos)> {
+        let (a, c) = (self.anchor?, self.cursor?);
+        Some(if a <= c { (a, c) } else { (c, a) })
+    }
+
+    /// Clears the selection (both ends unset).
+    pub fn reset(&mut self) {
+        self.anchor = None;
+        self.cursor = None;
     }
 }
 
-/// Mouse modifiers of a click on a diff row (a plain struct so the click rules
-/// are unit-testable without a real event system).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ClickMods {
-    /// Ctrl held: toggle the clicked line in/out of the selection.
-    pub ctrl: bool,
-    /// Shift held: select the display-order range from the anchor to the click.
-    pub shift: bool,
+/// Char column of the caret under a pointer x inside a cell's text area. Pure
+/// so the clamp rules are unit-testable: `col = ((x - text_left) / char_w)
+/// .round()` clamped to `[0, max_col]` — left of the text start clamps to 0,
+/// past the end of the line to `max_col` (the end-of-line caret). The float →
+/// usize cast saturates, so negatives round into 0.
+pub fn caret_from_pointer(
+    pointer_x: f32,
+    text_left: f32,
+    char_w: f32,
+    max_col: usize,
+    row: usize,
+    pane: Pane,
+) -> CaretPos {
+    let rel = (pointer_x - text_left) / char_w.max(1.0e-6);
+    let col = (rel.round() as usize).min(max_col);
+    CaretPos { row, pane, col }
 }
 
-/// Applies one click on a diff row:
-/// plain click = select only that line (anchor moves); ctrl+click = toggle that
-/// line (anchor moves); shift+click = select the display-order range from the
-/// anchor to the click, REPLACING the selection (anchor stays; a missing anchor
-/// behaves like a plain click).
-pub fn apply_click(sel: &mut DiffSelection, clicked: SelLine, mods: ClickMods) {
-    if mods.ctrl {
-        if !sel.lines.remove(&clicked) {
-            sel.lines.insert(clicked);
+/// A line's text with the terminator stripped — the form caret columns,
+/// painting and copying all work on.
+fn line_content(l: &Line) -> &str {
+    let t = l.text.strip_suffix('\n').unwrap_or(&l.text);
+    t.strip_suffix('\r').unwrap_or(t)
+}
+
+/// Char count of [`line_content`] — the caret column space of a line. Tabs
+/// count as one char: columns are indexes into the verbatim text (copies keep
+/// tabs, the display expands them to 4 spaces).
+fn line_chars(l: &Line) -> usize {
+    line_content(l).chars().count()
+}
+
+/// Selected char range of one cell under the normalized (from, to) carets, or
+/// `None` when the cell is outside the selection. `len` = the cell's char
+/// count (0 for filler/missing cells). Editor convention: the `from` cell
+/// keeps its tail `[from.col .. len)`, the `to` cell its head `[0 .. to.col)`,
+/// and cells in between are taken full-length.
+fn cell_selected_cols(
+    from: CaretPos,
+    to: CaretPos,
+    row: usize,
+    pane: Pane,
+    len: usize,
+) -> Option<(usize, usize)> {
+    let cell = (row, pane);
+    let from_cell = (from.row, from.pane);
+    let to_cell = (to.row, to.pane);
+    if from_cell == to_cell {
+        // both carets in one cell — normalized() already ordered the columns
+        if cell == from_cell {
+            return Some((from.col.min(len), to.col.min(len)));
         }
-        sel.anchor = Some(clicked);
-    } else if mods.shift {
-        let start = sel.anchor.unwrap_or(clicked);
-        let (lo, hi) = if start <= clicked { (start, clicked) } else { (clicked, start) };
-        let mut lines = BTreeSet::new();
-        let mut cur = lo;
-        loop {
-            lines.insert(cur);
-            if cur >= hi {
-                break;
-            }
-            cur = next_display_line(cur);
-        }
-        sel.lines = lines;
-    } else {
-        *sel = DiffSelection { lines: BTreeSet::from([clicked]), anchor: Some(clicked) };
+        return None;
+    }
+    if cell == from_cell {
+        return Some((from.col.min(len), len));
+    }
+    if cell == to_cell {
+        return Some((0, to.col.min(len)));
+    }
+    if from_cell < cell && cell < to_cell {
+        return Some((0, len));
+    }
+    None
+}
+
+/// Raw text of the selected cells: each in-range cell contributes its selected
+/// substring (terminator stripped, tabs kept verbatim), joined with `\n` in
+/// display order (row-major, left before right). Rows/cols out of the model (a
+/// stale selection right after the diff pair changed) are skipped — this never
+/// panics. A collapsed selection yields "".
+pub fn selection_text(model: &DiffModel, sel: &TextSelection) -> String {
+    match sel.normalized() {
+        Some((from, to)) => selection_segments(model, from, to).join("\n"),
+        None => String::new(),
     }
 }
 
-/// Next line in display order (row-major, left before right): the right cell of
-/// the same row, else the left cell of the next row. Rows beyond the model are
-/// harmless — they are filtered out at copy time — so no bound check is needed.
-fn next_display_line(l: SelLine) -> SelLine {
-    match l.pane {
-        Pane::Left => SelLine { row: l.row, pane: Pane::Right },
-        Pane::Right => SelLine { row: l.row + 1, pane: Pane::Left },
-    }
-}
-
-/// Raw text of the selected lines: content verbatim (tabs kept), line numbers
-/// and terminators stripped, joined with `\n` in display order. Rows out of
-/// range (a stale selection right after the diff pair changed) are skipped —
-/// this never panics.
-pub fn selection_text(model: &DiffModel, sel: &DiffSelection) -> String {
-    let mut out = String::new();
-    for s in &sel.lines {
-        let pane = match s.pane {
-            Pane::Left => &model.left,
-            Pane::Right => &model.right,
-        };
-        let Some(line) = pane.get(s.row) else { continue };
-        if !out.is_empty() {
-            out.push('\n');
+/// The selected substring of every in-range cell, in display order. Empty
+/// ranges (filler rows, end-of-line carets) keep an empty segment so the join
+/// preserves blank lines.
+fn selection_segments(model: &DiffModel, from: CaretPos, to: CaretPos) -> Vec<String> {
+    // iterate only as far as the model goes; stale rows beyond it are skipped
+    let max_row = model.left.len().max(model.right.len()).saturating_sub(1);
+    let last_row = to.row.min(max_row);
+    let mut out = Vec::new();
+    for row in from.row..=last_row {
+        for pane in [Pane::Left, Pane::Right] {
+            let lines = match pane {
+                Pane::Left => &model.left,
+                Pane::Right => &model.right,
+            };
+            let Some(line) = lines.get(row) else { continue };
+            let Some((c0, c1)) = cell_selected_cols(from, to, row, pane, line_chars(line)) else {
+                continue;
+            };
+            let t = line_content(line);
+            out.push(t.chars().skip(c0).take(c1.saturating_sub(c0)).collect());
         }
-        let t = line.text.strip_suffix('\n').unwrap_or(&line.text);
-        let t = t.strip_suffix('\r').unwrap_or(t);
-        out.push_str(t);
     }
     out
 }
 
+/// Geometry of one visible cell, kept while drawing so a global pointer
+/// position (reported by the drag owner's response) can be mapped back onto
+/// its (row, pane, col) caret.
+struct CellGeom<'a> {
+    row: usize,
+    pane: Pane,
+    rect: egui::Rect,
+    line: Option<&'a Line>,
+}
+
+/// Caret for a global pointer position: the cell containing the position wins
+/// (y picks the row, x the pane); a pointer dragged vertically past the drawn
+/// rows (outside the viewport) clamps to the nearest visible row. `None` when
+/// no rows are visible.
+fn caret_at_screen_pos(pos: egui::Pos2, cells: &[CellGeom<'_>], char_w: f32) -> Option<CaretPos> {
+    if let Some(c) = cells.iter().find(|c| c.rect.contains(pos)) {
+        return Some(cell_caret(c, pos.x, char_w));
+    }
+    let nearest = cells.iter().min_by(|a, b| {
+        let da = (pos.y - a.rect.center().y).abs();
+        let db = (pos.y - b.rect.center().y).abs();
+        da.total_cmp(&db)
+    })?;
+    Some(cell_caret(nearest, pos.x, char_w))
+}
+
+/// Caret inside one cell: the column comes from the monospace char grid
+/// ([`caret_from_pointer`]), clamped to the cell's own char count.
+fn cell_caret(c: &CellGeom<'_>, pointer_x: f32, char_w: f32) -> CaretPos {
+    let max_col = c.line.map(line_chars).unwrap_or(0);
+    caret_from_pointer(pointer_x, c.rect.left() + GUTTER, char_w, max_col, c.row, c.pane)
+}
+
 /// Renders the diff model into the center panel: two column headings +
-/// side-by-side rows. Also handles diff-row click selection and Ctrl+C
-/// (`egui::Event::Copy` — egui-winit turns the Ctrl+C / Ctrl+Insert chord into
-/// this event, so a `Key::C` press never fires): returns `Some(n)` when the raw
-/// text of the `n` selected lines was just copied to the clipboard (the caller
-/// shows the toast).
-pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut DiffSelection) -> Option<usize> {
+/// side-by-side rows. Also handles char-level selection (drag / shift+click on
+/// the diff cells, editor style) and Ctrl+C (`egui::Event::Copy` — egui-winit
+/// turns the Ctrl+C / Ctrl+Insert chord into this event, so a `Key::C` press
+/// never fires): returns `Some(n)` when the raw text of `n` non-empty selected
+/// cells was just copied to the clipboard (the caller shows the toast).
+pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) -> Option<usize> {
     let total = model.left.len().max(model.right.len());
     let note = model
         .note
@@ -345,6 +427,15 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut DiffSelection) 
     });
     ui.separator();
 
+    // Events collected while drawing, processed after the row loop (the paint
+    // of this frame already used the previous selection state; the update is
+    // visible next frame — standard immediate-mode one-frame latency).
+    let mut cells: Vec<CellGeom<'_>> = Vec::new();
+    let mut drag_start_pos = None; // drag_started: anchor goes to the press position
+    let mut drag_pos = None; // dragged/drag_stopped: cursor follows the pointer
+    let mut click_pos = None; // clicked (press + release, no drag)
+    let shift = ui.input(|i| i.modifiers.shift);
+
     // ONE ScrollArea walking row indexes → both columns in the same row ⇒
     // scrolling stays in sync naturally.
     egui::ScrollArea::both()
@@ -354,44 +445,99 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut DiffSelection) 
             for r in rows {
                 let l = model.left.get(r);
                 let rt = model.right.get(r);
-                let m = click_mods(ui);
+                let norm = sel.normalized();
+                let fill_l = norm.and_then(|(f, t)| {
+                    cell_selected_cols(f, t, r, Pane::Left, l.map(line_chars).unwrap_or(0))
+                });
+                let fill_r = norm.and_then(|(f, t)| {
+                    cell_selected_cols(f, t, r, Pane::Right, rt.map(line_chars).unwrap_or(0))
+                });
                 ui.horizontal(|ui| {
-                    let rl = draw_cell(ui, cell_w, row_h, l, sel.contains(Pane::Left, r));
-                    let rr = draw_cell(ui, cell_w, row_h, rt, sel.contains(Pane::Right, r));
+                    let rl = draw_cell(ui, cell_w, row_h, char_w, l, fill_l);
+                    let rr = draw_cell(ui, cell_w, row_h, char_w, rt, fill_r);
+                    cells.push(CellGeom { row: r, pane: Pane::Left, rect: rl.rect, line: l });
+                    cells.push(CellGeom { row: r, pane: Pane::Right, rect: rr.rect, line: rt });
+                    if rl.drag_started() {
+                        drag_start_pos = rl.interact_pointer_pos();
+                    }
+                    if rr.drag_started() {
+                        drag_start_pos = rr.interact_pointer_pos();
+                    }
+                    // egui fires drag events only on the cell that owns the
+                    // press, but the reported position is global: cells dragged
+                    // OVER count — the caret maps onto whatever cell it falls in
+                    if rl.dragged() || rl.drag_stopped() {
+                        drag_pos = rl.interact_pointer_pos();
+                    }
+                    if rr.dragged() || rr.drag_stopped() {
+                        drag_pos = rr.interact_pointer_pos();
+                    }
                     if rl.clicked() {
-                        // clicking a diff row gives up any lingering keyboard
-                        // focus (e.g. the file-search TextEdit) so the diff
-                        // view owns Ctrl+C from here on
-                        ui.memory_mut(|mem| {
-                            if let Some(f) = mem.focused() {
-                                mem.surrender_focus(f);
-                            }
-                        });
-                        apply_click(sel, SelLine { row: r, pane: Pane::Left }, m);
+                        click_pos = rl.interact_pointer_pos();
                     }
                     if rr.clicked() {
-                        ui.memory_mut(|mem| {
-                            if let Some(f) = mem.focused() {
-                                mem.surrender_focus(f);
-                            }
-                        });
-                        apply_click(sel, SelLine { row: r, pane: Pane::Right }, m);
+                        click_pos = rr.interact_pointer_pos();
                     }
                 });
+            }
+
+            // drag start: anchor and cursor both go to the press position
+            if let Some(pos) = drag_start_pos
+                && let Some(c) = caret_at_screen_pos(pos, &cells, char_w)
+            {
+                sel.anchor = Some(c);
+                sel.cursor = Some(c);
+                // starting a selection gives up any lingering keyboard focus
+                // (e.g. the file-search TextEdit) so the diff view owns Ctrl+C
+                ui.memory_mut(|mem| {
+                    if let Some(f) = mem.focused() {
+                        mem.surrender_focus(f);
+                    }
+                });
+                ui.ctx().request_repaint();
+            }
+            // dragging: the cursor follows the pointer
+            if let Some(pos) = drag_pos
+                && let Some(c) = caret_at_screen_pos(pos, &cells, char_w)
+            {
+                sel.cursor = Some(c);
+                ui.ctx().request_repaint();
+            }
+            // plain click: collapse the selection onto the click position;
+            // shift+click: move only the cursor, keeping the anchor (editor
+            // style — no anchor behaves like a plain click)
+            if let Some(pos) = click_pos
+                && let Some(c) = caret_at_screen_pos(pos, &cells, char_w)
+            {
+                ui.memory_mut(|mem| {
+                    if let Some(f) = mem.focused() {
+                        mem.surrender_focus(f);
+                    }
+                });
+                if shift && sel.anchor.is_some() {
+                    sel.cursor = Some(c);
+                } else {
+                    sel.anchor = Some(c);
+                    sel.cursor = Some(c);
+                }
+                ui.ctx().request_repaint();
             }
         });
 
     // Ctrl+C / Ctrl+Insert (the integration's "copy" command event): copy the
-    // raw text of the selected lines. Skipped while some other widget owns
+    // raw text of the selected cells. Skipped while some other widget owns
     // keyboard focus — a focused TextEdit handles Event::Copy itself (its
     // cursor selection wins; nothing is stolen from the modal/search boxes).
-    if !sel.lines.is_empty()
+    if !sel.is_empty()
         && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
         && ui.memory(|m| m.focused().is_none())
     {
         let text = selection_text(model, sel);
-        if !text.is_empty() {
-            let n = text.lines().count();
+        // every cell contributes exactly one line (terminators are stripped),
+        // so the "{n} segment(s)" count = the non-empty lines of the text —
+        // blank filler lines in the middle of a range are not segments
+        let n = text.lines().filter(|l| !l.is_empty()).count();
+        if n > 0 {
             ui.ctx().copy_text(text);
             return Some(n);
         }
@@ -399,18 +545,25 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut DiffSelection) 
     None
 }
 
-/// Click modifiers of the current frame, read once per row.
-fn click_mods(ui: &egui::Ui) -> ClickMods {
-    ui.input(|i| ClickMods { ctrl: i.modifiers.ctrl, shift: i.modifiers.shift })
-}
-
-/// Draws one cell (the left or right half of a diff row). `selected` adds the
-/// selection highlight on top of the del/add tint; the returned response is
-/// used for click handling.
-fn draw_cell(ui: &mut egui::Ui, w: f32, h: f32, line: Option<&Line>, selected: bool) -> egui::Response {
-    // raw Sense::CLICK (not Sense::click()) — cells must NOT be focusable, or
-    // clicking one would steal keyboard focus and block the Ctrl+C handler.
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::CLICK);
+/// Draws one cell (the left or right half of a diff row). `fill` = the selected
+/// char range to highlight on top of the del/add tint: partial ranges are
+/// painted by character on the monospace grid; a range covering the whole line
+/// (middle rows, filler/empty cells, end-of-line) paints the whole text area
+/// from the gutter to the cell edge — the line-number gutter is never tinted.
+/// The returned response is used for the drag/click selection handling.
+fn draw_cell(
+    ui: &mut egui::Ui,
+    w: f32,
+    h: f32,
+    char_w: f32,
+    line: Option<&Line>,
+    fill: Option<(usize, usize)>,
+) -> egui::Response {
+    // Sense::CLICK | Sense::DRAG — like Sense::click_and_drag() but WITHOUT
+    // focusable: focusable cells would steal keyboard focus and block the
+    // Ctrl+C handler; the drag sense is what enables char-level drag selection.
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::CLICK | egui::Sense::DRAG);
     let bg = line.and_then(|l| {
         if l.del {
             Some(DEL_BG)
@@ -423,12 +576,21 @@ fn draw_cell(ui: &mut egui::Ui, w: f32, h: f32, line: Option<&Line>, selected: b
     if let Some(bg) = bg {
         ui.painter().rect_filled(rect, 0.0, bg);
     }
-    if selected {
-        ui.painter().rect_filled(
-            rect,
-            0.0,
-            ui.visuals().selection.bg_fill.gamma_multiply(0.6),
-        );
+    if let Some((c0, c1)) = fill {
+        let len = line.map(line_chars).unwrap_or(0);
+        let x0 = rect.left() + GUTTER + c0 as f32 * char_w;
+        let x1 = if c0 == 0 && c1 >= len {
+            rect.right() // whole text area: middle rows, filler/empty cells, EOL
+        } else {
+            rect.left() + GUTTER + c1 as f32 * char_w
+        };
+        if x1 > x0 {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())),
+                0.0,
+                ui.visuals().selection.bg_fill.gamma_multiply(0.6),
+            );
+        }
     }
     ui.painter().vline(rect.left(), rect.y_range(), SEP_STROKE);
     let Some(l) = line else { return resp };
@@ -444,9 +606,7 @@ fn draw_cell(ui: &mut egui::Ui, w: f32, h: f32, line: Option<&Line>, selected: b
         );
     }
     // Strip the terminator for display; tabs become 4 spaces (monospace).
-    let t = l.text.strip_suffix('\n').unwrap_or(&l.text);
-    let t = t.strip_suffix('\r').unwrap_or(t);
-    let t = t.replace('\t', "    ");
+    let t = line_content(l).replace('\t', "    ");
     p.text(
         egui::pos2(rect.left() + GUTTER, y),
         egui::Align2::LEFT_CENTER,
@@ -596,118 +756,158 @@ mod tests {
         assert_eq!(m.max_chars, 5);
     }
 
-    // ----- selection → text (click rules + raw copy) -----
+    // ----- char-level selection: caret mapping, normalized, raw copy -----
 
-    fn mods(ctrl: bool, shift: bool) -> ClickMods {
-        ClickMods { ctrl, shift }
-    }
-
-    /// 3-row model: left = ["a", "old", filler], right = ["a", "new", "extra"].
+    /// 3-row model: left = ["alpha", "old line", filler],
+    /// right = ["alpha", "new line", "extra"].
     fn test_model() -> DiffModel {
         DiffModel {
             left_title: "left".into(),
             right_title: "right".into(),
-            left: vec![Line::context("a\n", 1), Line::del("old\n", 2), Line::filler()],
-            right: vec![Line::context("a\n", 1), Line::add("new\n", 2), Line::add("extra\n", 3)],
+            left: vec![Line::context("alpha\n", 1), Line::del("old line\n", 2), Line::filler()],
+            right: vec![
+                Line::context("alpha\n", 1),
+                Line::add("new line\n", 2),
+                Line::add("extra\n", 3),
+            ],
             binary: false,
             note: None,
             identical: false,
-            max_chars: 5,
+            max_chars: 8,
         }
     }
 
+    fn caret(row: usize, pane: Pane, col: usize) -> CaretPos {
+        CaretPos { row, pane, col }
+    }
+
+    fn sel_from_to(a: CaretPos, b: CaretPos) -> TextSelection {
+        TextSelection { anchor: Some(a), cursor: Some(b) }
+    }
+
     #[test]
-    fn plain_click_selects_one_line_and_copy_is_raw() {
+    fn caret_from_pointer_clamps_to_line_bounds() {
+        // far left of the text start → column 0
+        assert_eq!(caret_from_pointer(-100.0, 0.0, 10.0, 5, 2, Pane::Left), caret(2, Pane::Left, 0));
+        // inside the left half of the first char → still column 0
+        assert_eq!(caret_from_pointer(4.0, 0.0, 10.0, 5, 0, Pane::Right), caret(0, Pane::Right, 0));
+        // far right → clamped to the char count (end-of-line caret)
+        assert_eq!(caret_from_pointer(1000.0, 0.0, 10.0, 5, 1, Pane::Left), caret(1, Pane::Left, 5));
+    }
+
+    #[test]
+    fn caret_from_pointer_rounds_between_chars() {
+        // 1.5 char widths → rounds to column 2 (the caret sits between chars)
+        assert_eq!(caret_from_pointer(15.0, 0.0, 10.0, 9, 0, Pane::Left).col, 2);
+        // 1.49 char widths → still column 1
+        assert_eq!(caret_from_pointer(14.9, 0.0, 10.0, 9, 0, Pane::Left).col, 1);
+        // exactly at the text origin → column 0
+        assert_eq!(caret_from_pointer(0.0, 0.0, 10.0, 9, 0, Pane::Left).col, 0);
+        // row and pane pass through untouched
+        assert_eq!(caret_from_pointer(3.0, 0.0, 10.0, 9, 7, Pane::Right), caret(7, Pane::Right, 0));
+    }
+
+    #[test]
+    fn normalized_orders_reversed_drags() {
+        // anchor after cursor (a backwards drag) — display order comes out right
+        let sel = sel_from_to(caret(2, Pane::Right, 4), caret(0, Pane::Left, 1));
+        assert_eq!(sel.normalized(), Some((caret(0, Pane::Left, 1), caret(2, Pane::Right, 4))));
+        // same row: left before right
+        let sel = sel_from_to(caret(1, Pane::Right, 0), caret(1, Pane::Left, 3));
+        assert_eq!(sel.normalized(), Some((caret(1, Pane::Left, 3), caret(1, Pane::Right, 0))));
+        // either end unset → None
+        assert_eq!(TextSelection::default().normalized(), None);
+    }
+
+    #[test]
+    fn empty_selection_and_reset() {
+        let mut sel = sel_from_to(caret(0, Pane::Left, 2), caret(1, Pane::Right, 0));
+        assert!(!sel.is_empty());
+        sel.reset();
+        assert!(sel.is_empty());
+        assert_eq!(sel, TextSelection::default());
+        // collapsed: anchor == cursor (a plain click) — copies nothing
+        let sel = sel_from_to(caret(0, Pane::Left, 2), caret(0, Pane::Left, 2));
+        assert!(sel.is_empty());
+        assert_eq!(selection_text(&test_model(), &sel), "");
+    }
+
+    #[test]
+    fn same_cell_range_copies_substring() {
         let m = test_model();
-        let mut sel = DiffSelection::default();
-        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Left }, mods(false, false));
-        assert_eq!(sel.lines.len(), 1);
-        assert_eq!(sel.anchor, Some(SelLine { row: 1, pane: Pane::Left }));
-        // raw text: no line number, no terminator, no decoration
+        // "old line", columns 0..3
+        let sel = sel_from_to(caret(1, Pane::Left, 0), caret(1, Pane::Left, 3));
         assert_eq!(selection_text(&m, &sel), "old");
-        // a new plain click REPLACES the selection
-        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Right }, mods(false, false));
-        assert_eq!(selection_text(&m, &sel), "a");
+        // reversed within the cell (normalized swaps the columns)
+        let sel = sel_from_to(caret(1, Pane::Left, 3), caret(1, Pane::Left, 0));
+        assert_eq!(selection_text(&m, &sel), "old");
+        // past-the-end columns clamp to the line length
+        let sel = sel_from_to(caret(1, Pane::Left, 5), caret(1, Pane::Left, 100));
+        assert_eq!(selection_text(&m, &sel), "ine");
     }
 
     #[test]
-    fn chaotic_ctrl_clicks_copy_in_display_order() {
+    fn multi_row_range_takes_full_middle_cells() {
         let m = test_model();
-        let mut sel = DiffSelection::default();
-        // deliberately scrambled click order — the copy must still be in
-        // DISPLAY order (row-major, left before right at equal rows)
-        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Right }, mods(true, false));
-        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Left }, mods(true, false));
-        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Left }, mods(true, false));
-        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Right }, mods(true, false));
-        // ctrl+click toggles: select a filler row (empty text), then drop it
-        apply_click(&mut sel, SelLine { row: 2, pane: Pane::Left }, mods(true, false));
-        apply_click(&mut sel, SelLine { row: 2, pane: Pane::Left }, mods(true, false));
-        assert_eq!(selection_text(&m, &sel), "a\na\nold\nnew");
+        // from the middle of left row 0 to the middle of left row 1:
+        // from-cell tail + FULL in-between cells + to-cell head
+        let sel = sel_from_to(caret(0, Pane::Left, 2), caret(1, Pane::Left, 3));
+        assert_eq!(selection_text(&m, &sel), "pha\nalpha\nold");
     }
 
     #[test]
-    fn empty_selection_copies_nothing() {
+    fn range_across_panes_follows_display_order() {
         let m = test_model();
-        assert_eq!(selection_text(&m, &DiffSelection::default()), "");
-        // ctrl+clicking the only selected line empties the selection again
-        let mut sel = DiffSelection::default();
-        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Left }, mods(false, false));
-        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Left }, mods(true, false));
-        assert!(sel.lines.is_empty(), "ctrl+click must toggle the line off");
-        assert_eq!(selection_text(&m, &sel), "");
+        // left row 1 → right row 1 (same row, both panes)
+        let sel = sel_from_to(caret(1, Pane::Left, 4), caret(1, Pane::Right, 3));
+        assert_eq!(selection_text(&m, &sel), "line\nnew");
+        // a drag across the pane boundary carries into the next row's left cell
+        let sel = sel_from_to(caret(0, Pane::Right, 2), caret(1, Pane::Left, 3));
+        assert_eq!(selection_text(&m, &sel), "pha\nold");
     }
 
     #[test]
-    fn two_panes_same_row_left_before_right() {
+    fn filler_rows_copy_as_blank_lines() {
         let m = test_model();
-        let mut sel = DiffSelection::default();
-        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Right }, mods(true, false));
-        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Left }, mods(true, false));
-        assert_eq!(selection_text(&m, &sel), "old\nnew");
+        // left row 2 is a filler: inside the range it contributes an empty line
+        let sel = sel_from_to(caret(0, Pane::Left, 0), caret(2, Pane::Right, 2));
+        assert_eq!(selection_text(&m, &sel), "alpha\nalpha\nold line\nnew line\n\nex");
     }
 
     #[test]
-    fn shift_click_selects_range_from_anchor() {
-        let m = test_model();
-        let mut sel = DiffSelection::default();
-        // shift+click with no anchor behaves like a plain click
-        apply_click(&mut sel, SelLine { row: 2, pane: Pane::Right }, mods(false, true));
-        assert_eq!(selection_text(&m, &sel), "extra");
-        // plain click sets the anchor
-        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Left }, mods(false, false));
-        // shift+click replaces the selection with the display-order range
-        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Right }, mods(false, true));
-        assert_eq!(selection_text(&m, &sel), "a\na\nold\nnew");
-        // the anchor stays put: extending further still starts at the same origin
-        apply_click(&mut sel, SelLine { row: 2, pane: Pane::Right }, mods(false, true));
-        // the range includes the left filler row (an empty copied line)
-        assert_eq!(selection_text(&m, &sel), "a\na\nold\nnew\n\nextra");
-    }
-
-    #[test]
-    fn out_of_range_rows_are_skipped_never_panic() {
+    fn out_of_range_rows_and_cols_are_skipped_never_panic() {
         let m = test_model(); // 3 rows per pane
-        let mut sel = DiffSelection::default();
-        // stale rows left over from an older, longer diff pair
-        apply_click(&mut sel, SelLine { row: 10, pane: Pane::Left }, mods(true, false));
-        apply_click(&mut sel, SelLine { row: 99, pane: Pane::Right }, mods(true, false));
-        apply_click(&mut sel, SelLine { row: 0, pane: Pane::Left }, mods(true, false));
-        assert_eq!(selection_text(&m, &sel), "a");
-        // note-only model (empty panes) with the same selection — still no panic
+        // stale rows from an older, longer pair: entirely beyond the model
+        let sel = sel_from_to(caret(10, Pane::Left, 0), caret(12, Pane::Right, 4));
+        assert_eq!(selection_text(&m, &sel), "");
+        // columns past the end clamp; the from-cell at EOL copies nothing
+        let sel = sel_from_to(caret(1, Pane::Right, 100), caret(2, Pane::Right, 2));
+        assert_eq!(selection_text(&m, &sel), "\n\nex");
+        // a cursor row beyond the model extends the copy to the model's end
+        let sel = sel_from_to(caret(2, Pane::Left, 0), caret(99, Pane::Right, 2));
+        assert_eq!(selection_text(&m, &sel), "\nextra");
+        // note-only model (empty panes) with any selection — still no panic
         let empty = DiffModel::empty_note("gone");
+        let sel = sel_from_to(caret(0, Pane::Left, 0), caret(5, Pane::Right, 1));
         assert_eq!(selection_text(&empty, &sel), "");
     }
 
     #[test]
+    fn tabs_are_kept_verbatim_in_copies() {
+        let mut m = test_model();
+        m.left[1] = Line::del("a\tb\n", 2);
+        let sel = sel_from_to(caret(1, Pane::Left, 0), caret(1, Pane::Left, 3));
+        assert_eq!(selection_text(&m, &sel), "a\tb");
+    }
+
+    #[test]
     fn pair_change_resets_selection() {
-        // app::diff_panel resets to DiffSelection::default() when the diff key
-        // changes; the reset selection is empty against any model.
+        // app::diff_panel resets to TextSelection::default() when the diff key
+        // changes; the reset selection copies nothing against any model.
         let m = test_model();
-        let mut sel = DiffSelection::default();
-        apply_click(&mut sel, SelLine { row: 1, pane: Pane::Left }, mods(false, false));
-        assert_eq!(selection_text(&m, &sel), "old");
-        let sel = DiffSelection::default(); // the reset applied by app on a stale key
+        let mut sel = sel_from_to(caret(0, Pane::Left, 0), caret(1, Pane::Left, 2));
+        assert!(!selection_text(&m, &sel).is_empty());
+        sel.reset();
         let shorter = DiffModel {
             left: vec![Line::context("x\n", 1)],
             right: vec![Line::context("y\n", 1)],
