@@ -2,12 +2,17 @@
 //!
 //! Layout: a hidden winit event loop on the main thread (no window is ever created) keeps the
 //! process alive and pumps the messages a `tray-icon` notification icon + context menu need.
-//! The watcher pipeline (`run_with_root_paused`) runs on a background thread owned by main.rs;
-//! the tray only shares the store root plus two flags: `stop` (Quit) and `pause` (Pause/Resume
-//! watch — the pipeline then drops fs events, see lib.rs).
+//! The watcher pipeline (`run_with_root_paused`) runs on a background thread owned by
+//! `run_app` (lib.rs); the tray only shares the store root plus four flags: `stop` (Quit),
+//! `pause` (Pause/Resume watch — the pipeline then drops fs events, see lib.rs), `restart`
+//! (set by the update thread after the user confirmed a self-update) and `update_busy`
+//! (keeps one tray check/update at a time).
 //!
 //! Menu entries: Open GUI · Pause watch / Resume watch (this pair toggles hide-show) ·
-//! Clean up history (gc) · Quit. A left double-click on the icon also opens the GUI.
+//! Clean up history (gc) · Check for updates (`updater::prepare` fetches + stages the new
+//! version, then a message dialog asks — only a Yes runs `swap_all` + restart and
+//! `run_app` respawns the updated executable, plan §3.4) · Quit. A left double-click
+//! on the icon also opens the GUI.
 //!
 //! Implementation notes:
 //! - the tray icon is built once the event loop is running (`StartCause::Init` in
@@ -39,9 +44,14 @@ const ID_OPEN_GUI: &str = "tray.open_gui";
 const ID_PAUSE_WATCH: &str = "tray.pause_watch";
 const ID_RESUME_WATCH: &str = "tray.resume_watch";
 const ID_GC_NOW: &str = "tray.gc_now";
+/// Menu "Check for updates": runs `updater::prepare` on its own thread and reports every
+/// outcome in a message dialog. On a new version the user is asked first; only a Yes runs
+/// `updater::swap_all`, after which the thread sets `restart` and `about_to_wait` ends
+/// the loop so `run_app` respawns the updated executable (plan §3.4).
+const ID_CHECK_UPDATES: &str = "tray.check_updates";
 const ID_QUIT: &str = "tray.quit";
 
-/// Shared state the tray loop needs from its caller (main.rs).
+/// Shared state the tray loop needs from its caller (`run_app` in lib.rs).
 pub struct TrayConfig {
     /// Store root — used by the tray gc (menu "Clean up history") via a second connection.
     pub store_root: PathBuf,
@@ -49,10 +59,20 @@ pub struct TrayConfig {
     pub stop: Arc<AtomicBool>,
     /// true → the pipeline drops fs events (no recording); toggled by the pause/resume pair.
     pub pause: Arc<AtomicBool>,
+    /// Set true by the update thread after the user confirmed and `swap_all` succeeded →
+    /// `about_to_wait` stops the loop and `run_app` respawns the (updated) executable,
+    /// replaying the original launch args (plan §3.4).
+    pub restart: Arc<AtomicBool>,
+    /// One tray check/update at a time: the "Check for updates" item only spawns its
+    /// thread when `compare_exchange(false → true)` on this flag succeeds. The dialogs
+    /// of the flow block the update thread (never the tray loop) and the flag is
+    /// cleared when the flow's last dialog closes.
+    pub update_busy: Arc<AtomicBool>,
 }
 
 /// Entry point of tray mode: run the hidden winit event loop (tray icon + menu) until the
-/// user quits or the watcher thread finishes on its own.
+/// user quits, a tray-driven self-update requests a restart, or the watcher thread
+/// finishes on its own.
 ///
 /// `watcher` is the join handle of the pipeline thread spawned by main.rs. After the loop
 /// ends this thread is joined — its clean shutdown is what removes `daemon.json` — and its
@@ -109,8 +129,10 @@ impl TrayApp {
         let pause_watch = MenuItem::with_id(MenuId::new(ID_PAUSE_WATCH), &t!("tray.pause_watch"), true, None);
         let resume_watch = MenuItem::with_id(MenuId::new(ID_RESUME_WATCH), &t!("tray.resume_watch"), true, None);
         let gc_now = MenuItem::with_id(MenuId::new(ID_GC_NOW), &t!("tray.gc_now"), true, None);
+        let check_updates =
+            MenuItem::with_id(MenuId::new(ID_CHECK_UPDATES), &t!("tray.check_updates"), true, None);
         let quit = MenuItem::with_id(MenuId::new(ID_QUIT), &t!("tray.quit"), true, None);
-        menu.append_items(&[&open_gui, &pause_watch, &resume_watch, &gc_now, &quit])
+        menu.append_items(&[&open_gui, &pause_watch, &resume_watch, &gc_now, &check_updates, &quit])
             .map_err(|e| DaemonError::Tray(format!("menu: {e}")))?;
 
         // We start watching → "Resume watch" is hidden, "Pause watch" shown (best effort:
@@ -168,6 +190,123 @@ impl TrayApp {
             log::warn!("gc (tray) không tạo được thread (bỏ qua): {e}");
         }
     }
+
+    /// Menu "Check for updates": run `updater::prepare` on its own thread — fetching the
+    /// manifest and staging the artifacts can take seconds and the tray loop must not
+    /// freeze. `prepare` resolves its own source (`LH_UPDATE_SOURCE` env or
+    /// `<exe_dir>/update.json`) and downloads + verifies every artifact BEFORE asking, so
+    /// a confirmed update can swap in without a second download. Every outcome is shown
+    /// in a message dialog (the user just clicked the item — silence would look broken):
+    /// up to date → info, prepare failure → warning, new version → YesNo prompt that
+    /// gates `swap_all` + `restart`. The dialogs block this background thread (the tray
+    /// loop stays alive) and `update_busy` keeps a second click from spawning a parallel
+    /// flow meanwhile.
+    fn check_updates(&self) {
+        // One check/update at a time — the compare_exchange IS the lock; a second click
+        // while a dialog is open is ignored (logged).
+        if self
+            .cfg
+            .update_busy
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            log::info!("tray: kiểm tra cập nhật đang chạy — bỏ qua yêu cầu mới");
+            return;
+        }
+        let restart = self.cfg.restart.clone();
+        let update_busy = self.cfg.update_busy.clone();
+        let spawned = std::thread::Builder::new().name("lh-tray-update".into()).spawn(move || {
+            let opts = updater::UpdateOpts {
+                // No --source flag in tray mode: the updater falls back to the
+                // `LH_UPDATE_SOURCE` env var, then `<exe_dir>/update.json`.
+                source: None,
+                // Stage (download + verify) during prepare: answering Yes can then swap
+                // without another download pass.
+                check_only: false,
+                force: false,
+                // The respawn is `run_app`'s job (it happens after the watcher is joined
+                // and the store lock released) — the updater must not relaunch itself.
+                restart_args: None,
+            };
+            match updater::prepare(&opts) {
+                Ok(updater::Prepared::UpToDate { current_version, .. }) => {
+                    log::info!("tray: đã là bản mới nhất ({current_version})");
+                    message_dialog(
+                        rfd::MessageLevel::Info,
+                        rfd::MessageButtons::Ok,
+                        &t!("tray.check_updates"),
+                        &t!("tray.upd_dialog_uptodate", version = current_version),
+                    );
+                }
+                Ok(updater::Prepared::Ready(p)) => {
+                    log::info!(
+                        "tray: có bản mới {} -> {} (đã tải sẵn) — hỏi người dùng",
+                        p.current_version,
+                        p.manifest_version
+                    );
+                    // Ask BEFORE touching the running image: only a Yes swaps anything.
+                    if message_dialog(
+                        rfd::MessageLevel::Info,
+                        rfd::MessageButtons::YesNo,
+                        &t!("tray.upd_dialog_confirm"),
+                        &t!("tray.upd_dialog_new", from = p.current_version, to = p.manifest_version),
+                    ) {
+                        match updater::swap_all(updater::Prepared::Ready(p)) {
+                            Ok(report) => {
+                                log::info!(
+                                    "tray: đã cập nhật {} -> {} tại {} (updated {:?}, skipped {:?})",
+                                    report.from,
+                                    report.to,
+                                    report.path.display(),
+                                    report.updated,
+                                    report.skipped
+                                );
+                                // Confirm to the user first; setting `restart` afterwards
+                                // makes `about_to_wait` end the loop so `run_app` respawns
+                                // the updated executable (plan §3.4).
+                                message_dialog(
+                                    rfd::MessageLevel::Info,
+                                    rfd::MessageButtons::Ok,
+                                    &t!("tray.check_updates"),
+                                    &t!("tray.upd_done", from = report.from, to = report.to),
+                                );
+                                restart.store(true, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                log::warn!("tray: cập nhật lỗi (bỏ qua, daemon chạy tiếp): {e}");
+                                message_dialog(
+                                    rfd::MessageLevel::Warning,
+                                    rfd::MessageButtons::Ok,
+                                    &t!("tray.check_updates"),
+                                    &t!("tray.upd_err", e = e.to_string()),
+                                );
+                            }
+                        }
+                    } else {
+                        log::info!("tray: người dùng từ chối cập nhật");
+                    }
+                }
+                Err(e) => {
+                    log::warn!("tray: kiểm tra cập nhật lỗi (bỏ qua, daemon chạy tiếp): {e}");
+                    message_dialog(
+                        rfd::MessageLevel::Warning,
+                        rfd::MessageButtons::Ok,
+                        &t!("tray.check_updates"),
+                        &t!("tray.upd_err", e = e.to_string()),
+                    );
+                }
+            }
+            // Every branch ran its dialog to the end — release the guard so the menu item
+            // works again (on the success path the daemon restarts right after: the flag
+            // only needs to hold until `about_to_wait` notices `restart`).
+            update_busy.store(false, Ordering::Relaxed);
+        });
+        // Detached (handle dropped); spawn failure is logged, never surfaced to the menu.
+        if let Err(e) = spawned {
+            log::warn!("tray: không tạo được thread cập nhật (bỏ qua): {e}");
+            self.cfg.update_busy.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 impl ApplicationHandler for TrayApp {
@@ -205,6 +344,14 @@ impl ApplicationHandler for TrayApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The tray update thread finished successfully → stop the watcher and end the
+        // loop; `run_tray` joins the watcher (releases the store lock, removes
+        // daemon.json) and `run_app` respawns the updated executable (plan §3.4).
+        if self.cfg.restart.load(Ordering::Relaxed) {
+            self.cfg.stop.store(true, Ordering::Relaxed);
+            event_loop.exit();
+            return;
+        }
         // Drain menu clicks. muda queues them while the loop waits; every incoming Win32
         // message wakes the winit loop, so no polling interval is needed.
         while let Ok(event) = MenuEvent::receiver().try_recv() {
@@ -213,6 +360,7 @@ impl ApplicationHandler for TrayApp {
                 ID_PAUSE_WATCH => self.set_paused(true),
                 ID_RESUME_WATCH => self.set_paused(false),
                 ID_GC_NOW => self.gc_now(),
+                ID_CHECK_UPDATES => self.check_updates(),
                 ID_QUIT => {
                     // Watcher stops first — its return path cleans `daemon.json`; main.rs
                     // joins the thread right after this loop ends.
@@ -275,6 +423,28 @@ fn open_gui() {
     }
 }
 
+/// Blocking native message box (rfd → `MessageBoxW` on Windows) shown from the tray
+/// update thread — the winit loop keeps pumping while it is open. Returns `true` for
+/// `Ok`-closed dialogs and for the Yes button of a `YesNo` prompt; `false` means No (or
+/// a dismissed dialog). rfd 0.18 has no `MessageLevel::Question`, so the update prompt
+/// uses `Info`.
+fn message_dialog(
+    level: rfd::MessageLevel,
+    buttons: rfd::MessageButtons,
+    title: &str,
+    body: &str,
+) -> bool {
+    matches!(
+        rfd::MessageDialog::new()
+            .set_level(level)
+            .set_buttons(buttons)
+            .set_title(title)
+            .set_description(body)
+            .show(),
+        rfd::MessageDialogResult::Yes | rfd::MessageDialogResult::Ok
+    )
+}
+
 /// 32×32 RGBA tray icon built from the auto-generated data (`tray_icon_data`, same art as
 /// the exe/window icon) — raw bytes, no image decoding.
 fn icon_rgba() -> std::result::Result<Icon, BadIcon> {
@@ -320,11 +490,37 @@ mod tests {
         assert_eq!(t!("tray.resume_watch", locale = "en"), "Resume watch");
         assert_eq!(t!("tray.gc_now", locale = "vi"), "Dọn lịch sử");
         assert_eq!(t!("tray.gc_now", locale = "en"), "Clean up history");
+        assert_eq!(t!("tray.check_updates", locale = "vi"), "Kiểm tra cập nhật");
+        assert_eq!(t!("tray.check_updates", locale = "en"), "Check for updates");
         assert_eq!(t!("tray.quit", locale = "vi"), "Thoát");
         assert_eq!(t!("tray.quit", locale = "en"), "Quit");
         // tooltip says how to use the icon, in both locales
         assert!(t!("tray.tooltip", locale = "en").contains("double-click"), "{}", t!("tray.tooltip", locale = "en"));
         assert!(t!("tray.tooltip", locale = "vi").contains("nhấp đúp"), "{}", t!("tray.tooltip", locale = "vi"));
+    }
+
+    /// Strings of the "Check for updates" dialog flow — menu label + every dialog title
+    /// and body, both locales, placeholders substituted.
+    #[test]
+    fn i18n_update_dialog_keys_vi_and_en() {
+        // YesNo prompt: title + two-line body (versions in, action out)
+        assert_eq!(t!("tray.upd_dialog_confirm", locale = "vi"), "Có bản mới");
+        assert_eq!(t!("tray.upd_dialog_confirm", locale = "en"), "Update available");
+        for locale in ["vi", "en"] {
+            let body = t!("tray.upd_dialog_new", locale = locale, from = "0.1.0", to = "0.2.0").to_string();
+            assert!(body.contains("0.1.0") && body.contains("0.2.0"), "{locale}: {body}");
+            assert!(body.contains('\n'), "expected a two-line prompt, {locale}: {body:?}");
+        }
+        // up-to-date info carries the running version
+        for locale in ["vi", "en"] {
+            let body = t!("tray.upd_dialog_uptodate", locale = locale, version = "1.2.3").to_string();
+            assert!(body.contains("1.2.3"), "{locale}: {body}");
+        }
+        // success note carries from -> to, the error box carries the error text
+        assert!(t!("tray.upd_done", locale = "en", from = "0.1.0", to = "0.2.0").contains("0.2.0"));
+        assert!(t!("tray.upd_done", locale = "vi", from = "0.1.0", to = "0.2.0").contains("0.2.0"));
+        assert!(t!("tray.upd_err", locale = "en", e = "boom").contains("boom"));
+        assert!(t!("tray.upd_err", locale = "vi", e = "boom").contains("boom"));
     }
 
     #[test]

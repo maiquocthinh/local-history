@@ -11,9 +11,9 @@ err:
   read_current: "đọc nội dung hiện tại của %{file} lỗi: %{err}"
   empty_label: "label rỗng"
   current_exe: "không lấy được current_exe: %{err}"
-  exe_dir: "không lấy được thư mục chứa lh"
-  gui_missing: "chưa có %{path} — build trước: cargo build -p gui"
   spawn: "spawn %{path} lỗi: %{err}"
+  daemon_global_flags: "`daemon` không nhận flag toàn cục --json/--store/--lang — watcher nhận flag riêng của nó (--dir, --tray)"
+  self_update: "self-update lỗi: %{err}"
   outside_workspace: "không tìm thấy workspace chứa %{file} — file phải nằm trong một workspace đã đăng ký"
   cwd: "không lấy được thư mục hiện tại: %{err}"
   invalid_path: "đường dẫn không hợp lệ: %{path}"
@@ -71,3 +71,9 @@ gc:
   orphan_blobs: "  orphan blobs     : %{n}"
 ui:
   opened: "✓ đã mở lh-gui (pid %{pid})"
+selfupdate:
+  header: "self-update: đường dẫn cài %{path} — %{from} → %{to}"
+  up_to_date: "✓ đã là bản mới nhất (%{version})"
+  available: "có bản mới: %{from} → %{to} (chỉ kiểm tra — chưa tải hoặc cài gì)"
+  updated: "✓ đã cài: %{files}"
+  skipped: "  bỏ qua (không có trong bản cài này): %{files}"

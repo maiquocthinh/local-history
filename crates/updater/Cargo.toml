@@ -1,0 +1,16 @@
+[package]
+name = "updater"
+version.workspace = true
+edition.workspace = true
+description = "Self-update engine for lh.exe: manifest fetch + mandatory sha256 verification, metadata-only swap with rollback, stale recovery"
+
+[dependencies]
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+ureq = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

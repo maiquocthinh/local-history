@@ -1,4 +1,19 @@
-//! CLI `lh` — command-line interface for local-history (M3).
+//! CLI `lh` — the multi-call command-line interface for local-history (plan M4).
+//!
+//! One binary, several faces (the `gh`/`uv` model):
+//! - the 9 storage subcommands (status/history/show/diff/revert/label/gc/workspaces/ui)
+//!   keep their behavior unchanged;
+//! - `gui` runs the GUI in-process (foreground); `ui` still takes an optional
+//!   positional FILE and opens the GUI detached by re-invoking this binary with
+//!   `gui` (no sibling `lh-gui.exe` needed anymore);
+//! - `daemon` passes raw args through to the embedded watcher library
+//!   (`daemon::run_app`) — global flags are rejected first (clap would swallow
+//!   them silently, see `daemon_guard`);
+//! - `self-update` installs a new build via the `updater` crate.
+//!
+//! Bare `lh` (argv empty) opens the GUI — main.rs checks that BEFORE `Cli::parse`
+//! via [`run_default_gui`]; a flag-only invocation (e.g. `lh --json`) prints the
+//! root help to stderr and exits 2 ([`run`]).
 //!
 //! All logic lives in the lib (not just main.rs) so tests run in-process — the same pattern
 //! as the `daemon` crate. One `cmd_*` function per subcommand; helpers (tables, time, size,
@@ -11,7 +26,9 @@
 //! - `--json`: serde_json objects/arrays with English keys on stdout (error values are
 //!   still rendered in the chosen locale);
 //! - errors: stderr + exit 1 (with `--json` → `{"error": "..."}` on stdout for machines);
-//!   diffing binary content → exit 2 (scripts distinguish "has history but binary").
+//!   diffing binary content → exit 2 (scripts distinguish "has history but binary");
+//!   usage errors ([`CliError::Usage`]) → exit 2;
+//! - `daemon` propagates the watcher's own exit code directly (it owns its output).
 //!
 //! No extra deps beyond i18n: time/size/table formatting is hand-rolled (the `time`/`chrono`
 //! engines are not deps of this crate).
@@ -20,7 +37,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use rust_i18n::t;
 use serde_json::json;
 
@@ -41,15 +58,18 @@ pub enum CliError {
     History(history::Error),
     /// Content that cannot be diffed because it is binary — exit code 2.
     Binary(String),
+    /// Wrong CLI usage (e.g. global flags after `daemon`) — exit code 2, like
+    /// clap's own parse errors.
+    Usage(String),
     /// CLI-level failure carrying an already user-ready message.
     Msg(String),
 }
 
 impl CliError {
-    /// Process exit code: 2 for binary-content failures, 1 for every other error.
+    /// Process exit code: 2 for usage/binary-content failures, 1 for every other error.
     pub fn exit_code(&self) -> i32 {
         match self {
-            CliError::Binary(_) => 2,
+            CliError::Binary(_) | CliError::Usage(_) => 2,
             CliError::History(history::Error::BinaryContent(_)) => 2,
             _ => 1,
         }
@@ -61,6 +81,7 @@ impl std::fmt::Display for CliError {
         match self {
             CliError::History(e) => write!(f, "{e}"),
             CliError::Binary(s) => write!(f, "{s}"),
+            CliError::Usage(s) => write!(f, "{s}"),
             CliError::Msg(s) => write!(f, "{s}"),
         }
     }
@@ -82,14 +103,15 @@ impl From<std::io::Error> for CliError {
 
 // ---------- command definitions (clap derive) ----------
 
-/// Root command of `lh`: global flags plus the subcommand to run.
+/// Root command of `lh`: global flags plus an optional subcommand. No
+/// subcommand at all is meaningful now: bare `lh` (argv empty) is intercepted
+/// in main.rs (opens the GUI), while a flag-only invocation (e.g. `lh --json`)
+/// reaches [`run`] and exits with the root help on stderr + code 2.
 #[derive(Debug, Parser)]
 #[command(
     name = "lh",
     version,
-    about = "local-history — lịch sử thay đổi file độc lập VCS",
-    subcommand_required = true,
-    arg_required_else_help = true
+    about = "local-history — lịch sử thay đổi file độc lập VCS"
 )]
 pub struct Cli {
     /// Emit JSON instead of tables (English keys, written to stdout)
@@ -105,7 +127,7 @@ pub struct Cli {
     pub lang: Option<String>,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 /// One variant per `lh` subcommand.
@@ -161,10 +183,39 @@ pub enum Command {
     },
     /// Workspaces registered in the store
     Workspaces,
-    /// Launch the GUI (lh-gui) detached — returns immediately
+    /// Launch the GUI detached — returns immediately (positional FILE, like before)
     Ui {
         /// Open the timeline for this file (optional)
         file: Option<PathBuf>,
+    },
+    /// Run the GUI in this console (foreground — the window stays until closed)
+    Gui {
+        /// Open the timeline for this file (optional)
+        #[arg(long, value_name = "FILE")]
+        file: Option<PathBuf>,
+    },
+    /// Watcher passthrough — raw args go to the embedded daemon unchanged
+    Daemon {
+        /// Watcher args: `--dir PATH` (repeatable), `--tray`, `--help`.
+        /// Global flags (--json/--store/--lang) are rejected — see `daemon_guard`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Update this copy of lh.exe from the configured distribution source
+    SelfUpdate {
+        /// Distribution source: directory/UNC path or http(s) URL (default:
+        /// env LH_UPDATE_SOURCE, then update.json next to the executable)
+        #[arg(long, value_name = "SOURCE")]
+        source: Option<String>,
+        /// Check the manifest only — report the new version, install nothing
+        #[arg(long)]
+        check: bool,
+        /// Install even when the manifest version equals the running version
+        #[arg(long)]
+        force: bool,
+        /// Reopen the GUI from the new image after a successful install
+        #[arg(long)]
+        restart: bool,
     },
 }
 
@@ -175,11 +226,27 @@ pub fn run(cli: Cli) -> i32 {
     // user's language, then fails with a clear message (exit 1).
     rust_i18n::set_locale(&lang_choice(cli.lang.as_deref()));
 
+    // Flag-only invocation (e.g. `lh --json`): no subcommand → root help on
+    // stderr + usage exit 2. Bare `lh` (argv empty) never reaches here — main.rs
+    // intercepts it BEFORE `Cli::parse` and opens the GUI; `lh --help` is handled
+    // by clap itself (help on stdout, exit 0).
+    if cli.command.is_none() {
+        eprintln!("{}", Cli::command().render_help());
+        return 2;
+    }
+
     let result = match parse_lang(cli.lang.as_deref().unwrap_or("en")) {
         Ok(_) => dispatch(&cli),
         Err(e) => Err(e),
     };
     report(cli.json, result)
+}
+
+/// Entry point for the bare `lh` invocation (argv empty — main.rs calls this
+/// BEFORE `Cli::parse`): open the GUI detached. Text mode — failures print to
+/// stderr through `report`, success prints the "opened" line; exit 0 on success.
+pub fn run_default_gui() -> i32 {
+    report(false, spawn_gui(false, None))
 }
 
 /// Report the outcome: ok → exit 0; on error, JSON mode prints `{"error": ...}` to stdout
@@ -237,16 +304,43 @@ fn auto_lang() -> String {
 
 fn dispatch(cli: &Cli) -> Result<()> {
     match &cli.command {
-        Command::Status => cmd_status(cli),
-        Command::History { file } => cmd_history(cli, file),
-        Command::Show { file, at, output } => cmd_show(cli, file, at, output.as_deref()),
-        Command::Diff { file, a, b } => cmd_diff(cli, file, a, b),
-        Command::Revert { file, at, yes } => cmd_revert(cli, file, at, *yes),
-        Command::Label { file, text } => cmd_label(cli, file, text),
-        Command::Gc { dry_run } => cmd_gc(cli, *dry_run),
-        Command::Workspaces => cmd_workspaces(cli),
-        Command::Ui { file } => cmd_ui(cli, file.as_deref()),
+        // run() prints the root help + exit 2 before dispatch is ever called.
+        None => unreachable!("command=None is handled by run() before dispatch"),
+        Some(Command::Status) => cmd_status(cli),
+        Some(Command::History { file }) => cmd_history(cli, file),
+        Some(Command::Show { file, at, output }) => cmd_show(cli, file, at, output.as_deref()),
+        Some(Command::Diff { file, a, b }) => cmd_diff(cli, file, a, b),
+        Some(Command::Revert { file, at, yes }) => cmd_revert(cli, file, at, *yes),
+        Some(Command::Label { file, text }) => cmd_label(cli, file, text),
+        Some(Command::Gc { dry_run }) => cmd_gc(cli, *dry_run),
+        Some(Command::Workspaces) => cmd_workspaces(cli),
+        Some(Command::Ui { file }) => spawn_gui(cli.json, file.as_deref()),
+        Some(Command::Gui { file }) => cmd_gui(file.as_deref()),
+        Some(Command::Daemon { args }) => {
+            daemon_guard(cli)?;
+            // The watcher owns its output and exit codes (its own parse errors
+            // exit 2): propagate the code directly, bypassing report().
+            std::process::exit(daemon::run_app(args.iter().cloned()));
+        }
+        Some(Command::SelfUpdate {
+            source,
+            check,
+            force,
+            restart,
+        }) => cmd_self_update(cli, source.as_deref(), *check, *force, *restart),
     }
+}
+
+/// Guard for the `daemon` passthrough arm (plan review note 2): clap swallows
+/// the global flags even when they come AFTER the subcommand — a plain
+/// passthrough would silently watch the DEFAULT store instead of erroring like
+/// `lh-daemon --store S` does today. Reject them with a usage error (exit 2)
+/// before handing args to the watcher.
+fn daemon_guard(cli: &Cli) -> Result<()> {
+    if cli.store.is_some() || cli.json || cli.lang.is_some() {
+        return Err(CliError::Usage(t!("err.daemon_global_flags").to_string()));
+    }
+    Ok(())
 }
 
 // ---------- store helpers ----------
@@ -687,22 +781,21 @@ fn cmd_workspaces(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn cmd_ui(cli: &Cli, file: Option<&Path>) -> Result<()> {
+/// Spawn the GUI detached: the multi-call binary re-invokes itself with the
+/// `gui` subcommand (`current_exe() + ["gui"]`, optionally `--file <path>`) —
+/// no sibling `lh-gui.exe` needed anymore. Ok keeps the preserved output
+/// shapes (text `ui.opened` / JSON `{"spawned","pid","gui"}` — the "gui" value
+/// is now the path of this exe); every failure becomes a `CliError` so
+/// `report()` keeps the `--json` error contract (plan review note 5).
+/// `json_mode` is passed explicitly because this helper serves both `lh ui`
+/// and the bare-`lh` entry ([`run_default_gui`], always text mode).
+fn spawn_gui(json_mode: bool, file: Option<&Path>) -> Result<()> {
     let exe = std::env::current_exe()
         .map_err(|e| CliError::Msg(t!("err.current_exe", err = e).to_string()))?;
-    let gui = exe
-        .parent()
-        .ok_or_else(|| CliError::Msg(t!("err.exe_dir").to_string()))?
-        .join(format!("lh-gui{}", std::env::consts::EXE_SUFFIX));
-    if !gui.exists() {
-        return Err(CliError::Msg(
-            t!("err.gui_missing", path = gui.display()).to_string(),
-        ));
-    }
-
-    let mut cmd = std::process::Command::new(&gui);
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("gui");
     if let Some(f) = file {
-        // GUI canonicalizes and resolves the workspace itself (contract: `lh-gui --file <path>`)
+        // GUI canonicalizes and resolves the workspace itself (contract: `--file <path>`)
         cmd.args(["--file", &f.display().to_string()]);
     }
     #[cfg(windows)]
@@ -715,15 +808,96 @@ fn cmd_ui(cli: &Cli, file: Option<&Path>) -> Result<()> {
     }
     let child = cmd
         .spawn()
-        .map_err(|e| CliError::Msg(t!("err.spawn", path = gui.display(), err = e).to_string()))?;
+        .map_err(|e| CliError::Msg(t!("err.spawn", path = exe.display(), err = e).to_string()))?;
+
+    if json_mode {
+        println!(
+            "{}",
+            json!({ "spawned": true, "pid": child.id(), "gui": exe.display().to_string() })
+        );
+    } else {
+        println!("{}", t!("ui.opened", pid = child.id()));
+    }
+    Ok(())
+}
+
+/// Run the GUI in-process (foreground): the window stays until closed and the
+/// `lh` process exits with the GUI's outcome.
+fn cmd_gui(file: Option<&Path>) -> Result<()> {
+    gui::run(file.map(gui::normalize_user_path))
+        .map_err(|e| CliError::Msg(format!("gui: {e}")))
+}
+
+/// Self-update via the `updater` crate (plan §3.1/§3.3): fetch manifest →
+/// verify sha256 → metadata-only swap with rollback. Always names the install
+/// being updated (path of the running exe) plus the running and target
+/// versions (review note 8 — multi-install awareness).
+fn cmd_self_update(
+    cli: &Cli,
+    source: Option<&str>,
+    check: bool,
+    force: bool,
+    restart: bool,
+) -> Result<()> {
+    let exe = std::env::current_exe()
+        .map_err(|e| CliError::Msg(t!("err.current_exe", err = e).to_string()))?;
+
+    let opts = updater::UpdateOpts {
+        source: source.map(str::to_string),
+        check_only: check,
+        force,
+        // `--restart` reopens the GUI from the freshly installed image (the
+        // updater only relaunches when artifacts were actually swapped).
+        restart_args: restart.then(|| vec!["gui".to_string()]),
+    };
+    let report = updater::update(&opts)
+        .map_err(|e| CliError::Msg(t!("err.self_update", err = e).to_string()))?;
 
     if cli.json {
         println!(
             "{}",
-            json!({ "spawned": true, "pid": child.id(), "gui": gui.display().to_string() })
+            json!({
+                "path": exe.display().to_string(),
+                "from": report.from,
+                "to": report.to,
+                "check_only": check,
+                "up_to_date": report.up_to_date,
+                "updated": report.updated,
+                "skipped": report.skipped,
+            })
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        t!(
+            "selfupdate.header",
+            path = exe.display(),
+            from = report.from,
+            to = report.to
+        )
+    );
+    if report.up_to_date {
+        println!("{}", t!("selfupdate.up_to_date", version = report.from));
+    } else if check {
+        println!(
+            "{}",
+            t!("selfupdate.available", from = report.from, to = report.to)
         );
     } else {
-        println!("{}", t!("ui.opened", pid = child.id()));
+        if !report.updated.is_empty() {
+            println!(
+                "{}",
+                t!("selfupdate.updated", files = report.updated.join(", "))
+            );
+        }
+        if !report.skipped.is_empty() {
+            println!(
+                "{}",
+                t!("selfupdate.skipped", files = report.skipped.join(", "))
+            );
+        }
     }
     Ok(())
 }
@@ -1084,6 +1258,104 @@ mod tests {
         assert!(parse_at("").is_err());
         assert!(parse_at("-3").is_err());
         assert!(parse_seq("1.5").is_err());
+    }
+
+    // ----- multi-call parse (plan M4) -----
+
+    #[test]
+    fn parse_daemon_passthrough_raw_args() {
+        let cli = Cli::try_parse_from(["lh", "daemon", "--tray", "--dir", "X"]).unwrap();
+        let Some(Command::Daemon { args }) = &cli.command else {
+            panic!("expected Daemon, got {:?}", cli.command)
+        };
+        assert_eq!(args, &["--tray", "--dir", "X"]);
+        // clean invocation: no global flag was captured
+        assert!(!cli.json);
+        assert!(cli.store.is_none());
+        assert!(cli.lang.is_none());
+    }
+
+    #[test]
+    fn daemon_guard_rejects_global_flags_both_sides() {
+        // clap swallows --store even AFTER the subcommand (probe, review note 2):
+        // the raw args lose it while cli.store still carries it — the guard must
+        // fire so the watcher never silently watches the default store.
+        let cli = Cli::try_parse_from(["lh", "daemon", "--store", "S", "--dir", "X"]).unwrap();
+        assert_eq!(cli.store.as_deref(), Some(Path::new("S")));
+        let err = daemon_guard(&cli).unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 2);
+
+        let cli = Cli::try_parse_from(["lh", "daemon", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(daemon_guard(&cli).is_err());
+
+        // flags BEFORE the subcommand are caught too
+        let cli = Cli::try_parse_from(["lh", "--lang", "vi", "daemon"]).unwrap();
+        assert_eq!(cli.lang.as_deref(), Some("vi"));
+        assert!(daemon_guard(&cli).is_err());
+
+        // a clean daemon invocation passes the guard
+        let cli = Cli::try_parse_from(["lh", "daemon", "--tray"]).unwrap();
+        assert!(daemon_guard(&cli).is_ok());
+    }
+
+    #[test]
+    fn parse_bare_lh_and_flag_only_command_is_none() {
+        // bare `lh` parses with command None — main.rs intercepts argv-empty
+        // BEFORE parse (run_default_gui); run() prints help + exit 2 for it
+        let cli = Cli::try_parse_from(["lh"]).unwrap();
+        assert!(cli.command.is_none());
+        // a flag-only invocation parses too (no subcommand_required anymore)
+        let cli = Cli::try_parse_from(["lh", "--json"]).unwrap();
+        assert!(cli.command.is_none() && cli.json);
+    }
+
+    #[test]
+    fn parse_gui_takes_file_flag() {
+        let cli = Cli::try_parse_from(["lh", "gui", "--file", "p"]).unwrap();
+        let Some(Command::Gui { file }) = &cli.command else {
+            panic!("expected Gui, got {:?}", cli.command)
+        };
+        assert_eq!(file.as_deref(), Some(Path::new("p")));
+    }
+
+    #[test]
+    fn parse_ui_keeps_positional_file() {
+        // `lh ui [FILE]` stays positional (review note 3)
+        let cli = Cli::try_parse_from(["lh", "ui", "X"]).unwrap();
+        let Some(Command::Ui { file }) = &cli.command else {
+            panic!("expected Ui, got {:?}", cli.command)
+        };
+        assert_eq!(file.as_deref(), Some(Path::new("X")));
+        // `lh ui --file X` → usage error, exit code 2 (old behavior kept)
+        let err = Cli::try_parse_from(["lh", "ui", "--file", "X"]).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn parse_self_update_flags() {
+        let cli = Cli::try_parse_from([
+            "lh",
+            "self-update",
+            "--source",
+            "S",
+            "--check",
+            "--force",
+            "--restart",
+        ])
+        .unwrap();
+        let Some(Command::SelfUpdate {
+            source,
+            check,
+            force,
+            restart,
+        }) = &cli.command
+        else {
+            panic!("expected SelfUpdate, got {:?}", cli.command)
+        };
+        assert_eq!(source.as_deref(), Some("S"));
+        assert!(*check && *force && *restart);
     }
 
     // ----- resolve workspace -----

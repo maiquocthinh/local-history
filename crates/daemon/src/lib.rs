@@ -5,7 +5,8 @@
 //!   fs event → ignore filter (per component) → debounce map (path → instant)
 //!   → path quiet ≥ DEBOUNCE_MS → read file → `record(..., External)` (dedup in engine)
 //!
-//! All logic lives in the lib (not main.rs) so tests can run in-process via `run_with_root`.
+//! All logic lives in the lib (not main.rs) so tests can run in-process via `run_with_root`;
+//! the binary entry point is `run_app` (args come in through its parameter — one source).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -255,6 +256,225 @@ pub fn is_ignored(path: &Path) -> bool {
     })
 }
 
+// ---------- binary entry point (`lh-daemon`; main.rs is a thin wrapper around `run_app`) ----------
+
+/// Usage message printed for `--help` and for bad args (kept verbatim from the pre-lib
+/// main.rs so the binary's output does not change).
+const USAGE: &str =
+    "cách dùng: lh-daemon [--tray] [--dir PATH]... (--dir lặp lại được; không có --dir → theo dõi thư mục hiện tại; --tray → chạy trong system tray thay vì console treo)";
+
+/// Minimal stderr logger (no extra dependency) so the lib's logs (gc, warnings, ...) are
+/// visible. Uses a static logger — the log crate here is built without the `alloc` feature,
+/// so `set_boxed_logger` is unavailable. `run_app` installs it; in-process callers can
+/// install their own instance the same way.
+pub struct StderrLogger;
+
+static STDERR_LOGGER: StderrLogger = StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Parses the daemon CLI args and runs until stopped: `--tray` runs the tray (icon + menu on
+/// the calling thread, watcher pipeline on a background thread), otherwise the blocking
+/// console watcher (`--dir PATH` repeatable; without `--dir` the current directory is
+/// watched). Returns the process exit code — 0 ok, 1 runtime error, 2 usage error — the
+/// caller decides what to do with it; this function never terminates the process.
+///
+/// ONE args source (plan §3.1, review feedback #6): everything is parsed from the iterator
+/// passed in, the lib never re-reads `env::args()` — safe for in-process callers.
+///
+/// The iterator holds the daemon args WITHOUT the program name (thin `main.rs` passes
+/// `env::args().skip(1)`, the CLI `daemon` arm passes the raw clap args). They are
+/// replayed verbatim by the tray self-update respawn (plan §3.4); restoring the `daemon`
+/// subcommand for the multi-call `lh` image is `respawn_command`'s job, not the caller's.
+pub fn run_app(args: impl Iterator<Item = String>) -> i32 {
+    let _ = log::set_logger(&STDERR_LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
+
+    let argv: Vec<String> = args.collect();
+    // The daemon args AS PASSED IN — replayed verbatim to the respawned executable after
+    // a tray-driven self-update (plan §3.4). Every caller already strips the program name
+    // (thin `main.rs` passes `env::args().skip(1)`, the CLI `daemon` arm passes the raw
+    // clap args), so nothing is cut here: slicing off a leading element would drop the
+    // first real flag (`--tray`/`--dir`) from the respawn. ONE args source (review note
+    // 6): taken from the iterator passed in, the lib never re-reads `env::args()`.
+    let launch_args: Vec<String> = argv.clone();
+
+    let mut watch_dirs: Vec<PathBuf> = Vec::new();
+    let mut tray_mode = false;
+    let mut it = argv.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--dir" => match it.next() {
+                Some(p) => watch_dirs.push(PathBuf::from(p)),
+                None => {
+                    eprintln!("lh-daemon: --dir cần một PATH\n{USAGE}");
+                    return 2;
+                }
+            },
+            // Tray mode: same watcher pipeline, but no blocking console — icon + menu instead.
+            "--tray" => tray_mode = true,
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return 0;
+            }
+            other => {
+                eprintln!("lh-daemon: không hiểu argument `{other}`\n{USAGE}");
+                return 2;
+            }
+        }
+    }
+    if watch_dirs.is_empty() {
+        match std::env::current_dir() {
+            Ok(d) => watch_dirs.push(d),
+            Err(e) => {
+                eprintln!("lh-daemon: không lấy được thư mục hiện tại: {e}");
+                return 2;
+            }
+        }
+    }
+
+    let store_root = match history::LocalHistory::default_root() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("lh-daemon: {e}");
+            return 1;
+        }
+    };
+
+    println!("lh-daemon {} (store root: {})", env!("CARGO_PKG_VERSION"), store_root.display());
+    for d in &watch_dirs {
+        println!("  watch: {}", d.display());
+    }
+
+    if tray_mode {
+        // Tray mode: watcher pipeline on a background thread; the tray (icon + menu) runs on
+        // the main thread — Windows requires the icon on the thread owning the event loop.
+        let stop = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        let restart = Arc::new(AtomicBool::new(false));
+        let update_busy = Arc::new(AtomicBool::new(false));
+        let watch_stop = stop.clone();
+        let watch_pause = pause.clone();
+        let dirs = watch_dirs.clone();
+        let store = store_root.clone();
+        let spawned = std::thread::Builder::new().name("lh-daemon-watch".into()).spawn(move || {
+            run_with_root_paused(&store, &dirs, watch_stop, watch_pause)
+        });
+        let watcher = match spawned {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("lh-daemon: không tạo được thread watcher: {e}");
+                return 1;
+            }
+        };
+        println!("chạy trong system tray — chuột phải icon để mở menu, Thoát để dừng.");
+        match tray::run_tray(
+            tray::TrayConfig {
+                store_root: store_root.clone(),
+                stop,
+                pause,
+                restart: restart.clone(),
+                update_busy,
+            },
+            watcher,
+        ) {
+            Ok(()) => {
+                // The tray update menu item succeeded: the watcher is already joined here
+                // (store lock released, daemon.json cleaned) — respawn the updated
+                // executable detached, replaying the original launch args (plan §3.4).
+                if restart.load(Ordering::Relaxed) {
+                    println!("cập nhật xong — khởi động lại daemon...");
+                    return respawn_self(&launch_args);
+                }
+                println!("đã dừng.");
+            }
+            Err(e) => {
+                eprintln!("lh-daemon: {e}");
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    // Ctrl+C: the OS default terminate — the lock releases when the process dies; a stale
+    // daemon.json is left behind and later CLI runs check the pid (not handled here).
+    println!("Ctrl+C (hoặc kill tiến trình) để dừng.");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    if let Err(e) = run(&watch_dirs, stop) {
+        eprintln!("lh-daemon: {e}");
+        return 1;
+    }
+    println!("đã dừng.");
+    0
+}
+
+/// Respawn the current executable detached with `args` — the restart half of the tray
+/// self-update (plan §3.4). Called only after `run_tray` returned, i.e. the watcher was
+/// joined first: `daemon.lock` is released and `daemon.json` cleaned, so the fresh
+/// process can take over the store. Returns the process exit code: 0 spawned, 1 failure
+/// (message already printed).
+fn respawn_self(args: &[String]) -> i32 {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("lh-daemon: không lấy được current_exe để khởi động lại: {e}");
+            return 1;
+        }
+    };
+    let mut cmd = respawn_command(&exe, args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    match cmd.spawn() {
+        Ok(child) => {
+            println!("đã khởi động lại daemon (pid {})", child.id());
+            0
+        }
+        Err(e) => {
+            eprintln!("lh-daemon: spawn {} lỗi khi khởi động lại: {e}", exe.display());
+            1
+        }
+    }
+}
+
+/// The respawn `Command` for `exe` + the daemon `args` as passed to `run_app` — pure, so
+/// the command line shape is unit-testable without spawning anything. When the running
+/// image is the multi-call `lh` CLI the `daemon` subcommand must be replayed, otherwise
+/// the child would come up as the GUI (`lh --tray ...`) or die on a clap usage error
+/// (`lh --dir ws`); the standalone `lh-daemon` binary takes the args as-is.
+fn respawn_command(exe: &Path, args: &[String]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    if is_multi_call_cli(exe) {
+        cmd.arg("daemon");
+    }
+    cmd.args(args);
+    cmd
+}
+
+/// True when `exe` is the multi-call `lh` CLI image (the respawn must replay the
+/// `daemon` subcommand), false for the standalone `lh-daemon` binary and anything else.
+/// Matched on the file stem, case-insensitively (Windows filenames are case-insensitive).
+fn is_multi_call_cli(exe: &Path) -> bool {
+    exe.file_stem().is_some_and(|s| s.eq_ignore_ascii_case("lh"))
+}
+
 // ---------- internals ----------
 
 /// Ignore filter applied RELATIVE to the watched root — avoids false positives when an
@@ -407,5 +627,51 @@ fn process_one(engine: &LocalHistory, ws_entries: &[(PathBuf, WorkspaceId)], pat
             Ok(_) => {} // never had history — skip
             Err(e) => log::warn!("history {path_str} lỗi (bỏ qua): {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cmd_args(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn respawn_under_lh_restores_daemon_subcommand() {
+        let cmd = respawn_command(
+            Path::new(r"C:\bin\lh.exe"),
+            &["--tray".into(), "--dir".into(), r"D:\ws".into()],
+        );
+        assert_eq!(cmd.get_program(), r"C:\bin\lh.exe");
+        assert_eq!(cmd_args(&cmd), vec!["daemon", "--tray", "--dir", r"D:\ws"]);
+    }
+
+    #[test]
+    fn respawn_standalone_daemon_keeps_args_asis() {
+        let cmd = respawn_command(
+            Path::new(r"C:\bin\lh-daemon.exe"),
+            &["--tray".into(), "--dir".into(), r"D:\ws".into()],
+        );
+        assert_eq!(cmd.get_program(), r"C:\bin\lh-daemon.exe");
+        assert_eq!(cmd_args(&cmd), vec!["--tray", "--dir", r"D:\ws"]);
+    }
+
+    #[test]
+    fn multi_call_detection_is_case_insensitive_cross_platform() {
+        assert!(is_multi_call_cli(Path::new(r"C:\bin\lh.exe")));
+        assert!(is_multi_call_cli(Path::new(r"C:\bin\LH.EXE")));
+        assert!(is_multi_call_cli(Path::new("/usr/local/bin/lh")));
+        let cmd = respawn_command(Path::new(r"C:\bin\lh.exe"), &[]);
+        assert_eq!(cmd_args(&cmd), vec!["daemon"]);
+    }
+
+    #[test]
+    fn other_images_are_not_the_multi_call_cli() {
+        assert!(!is_multi_call_cli(Path::new(r"C:\bin\lh-daemon.exe")));
+        assert!(!is_multi_call_cli(Path::new(r"C:\bin\lh-gui.exe")));
+        assert!(!is_multi_call_cli(Path::new(r"C:\bin\mytool.exe")));
+        assert!(!is_multi_call_cli(Path::new("lh-daemon")));
     }
 }

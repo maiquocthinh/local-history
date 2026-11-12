@@ -10,4 +10,12 @@ tray:
   pause_watch: "Pause watch"
   resume_watch: "Resume watch"
   gc_now: "Clean up history"
+  check_updates: "Check for updates"
+  # "Check for updates" dialog flow: YesNo prompt (title + two-line body), up-to-date
+  # info, success note and failure warning.
+  upd_dialog_confirm: "Update available"
+  upd_dialog_new: "Version %{to} is ready (running %{from}).\nDownload and restart the daemon?"
+  upd_dialog_uptodate: "Already on the latest version (%{version})"
+  upd_done: "Daemon updated %{from} → %{to} — the daemon will restart now."
+  upd_err: "Update failed: %{e}"
   quit: "Quit"

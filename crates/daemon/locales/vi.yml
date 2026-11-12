@@ -10,4 +10,12 @@ tray:
   pause_watch: "Tạm dừng watch"
   resume_watch: "Tiếp tục watch"
   gc_now: "Dọn lịch sử"
+  check_updates: "Kiểm tra cập nhật"
+  # Luồng dialog "Kiểm tra cập nhật": prompt YesNo (tiêu đề + nội dung 2 dòng), info đã
+  # là bản mới nhất, thông báo thành công và cảnh báo lỗi.
+  upd_dialog_confirm: "Có bản mới"
+  upd_dialog_new: "Phiên bản %{to} sẵn sàng (đang chạy %{from}).\nTải về và khởi động lại daemon?"
+  upd_dialog_uptodate: "Đã là bản mới nhất (phiên bản %{version})"
+  upd_done: "Đã cập nhật daemon %{from} → %{to} — daemon sẽ khởi động lại ngay."
+  upd_err: "Cập nhật không thành công: %{e}"
   quit: "Thoát"

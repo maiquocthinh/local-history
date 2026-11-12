@@ -11,9 +11,9 @@ err:
   read_current: "failed to read the current content of %{file}: %{err}"
   empty_label: "label is empty"
   current_exe: "failed to get current_exe: %{err}"
-  exe_dir: "failed to get the directory containing the lh executable"
-  gui_missing: "%{path} not found — build it first: cargo build -p gui"
   spawn: "failed to spawn %{path}: %{err}"
+  daemon_global_flags: "`daemon` does not accept the global flags --json/--store/--lang — the watcher takes its own flags (--dir, --tray)"
+  self_update: "self-update failed: %{err}"
   outside_workspace: "no registered workspace contains %{file} — the file must be inside a registered workspace"
   cwd: "failed to get the current directory: %{err}"
   invalid_path: "invalid path: %{path}"
@@ -71,3 +71,9 @@ gc:
   orphan_blobs: "  orphan blobs     : %{n}"
 ui:
   opened: "✓ opened lh-gui (pid %{pid})"
+selfupdate:
+  header: "self-update: install path %{path} — %{from} → %{to}"
+  up_to_date: "✓ already up to date (%{version})"
+  available: "update available: %{from} → %{to} (check only — nothing downloaded or installed)"
+  updated: "✓ installed: %{files}"
+  skipped: "  skipped (not present in this install): %{files}"

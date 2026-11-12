@@ -4,6 +4,7 @@ members = [
     "crates/daemon",
     "crates/cli",
     "crates/gui",
+    "crates/updater",
 ]
 resolver = "3"
 
@@ -34,3 +35,7 @@ rust-i18n = "3"
 sys-locale = "0.3"
 tray-icon = "0.26"
 winit = "0.30"
+# self-update (plan §3.2): ureq ships pure-Rust rustls TLS for http(s) sources;
+# sha2 verifies every manifest artifact (mandatory — never skip verification)
+ureq = "3.5.1"
+sha2 = "0.11"

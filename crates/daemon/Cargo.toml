@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 history = { path = "../history" }
+updater = { path = "../updater" }
 notify = { workspace = true }
 fd-lock = { workspace = true }
 serde = { workspace = true }
@@ -19,6 +20,8 @@ rust-i18n = { workspace = true }
 sys-locale = { workspace = true }
 tray-icon = { workspace = true }
 winit = { workspace = true }
+# Message dialogs for the tray "Check for updates" flow (native MessageBoxW on Windows).
+rfd = { workspace = true }
 
 [build-dependencies]
 winresource = "0.1"
