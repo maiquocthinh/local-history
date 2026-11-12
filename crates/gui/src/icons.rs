@@ -14,7 +14,7 @@ pub const FONT_BYTES: &[u8] = include_bytes!("../assets/MaterialIcons-Regular.tt
 #[cfg_attr(not(test), allow(dead_code))]
 pub const CODEPOINTS: &str = include_str!("../assets/MaterialIcons-Regular.codepoints");
 
-// Codepoints verified by hand against MaterialIcons-Regular.codepoints (the 12 icons in use):
+// Codepoints verified by hand against MaterialIcons-Regular.codepoints (the 13 icons in use):
 /// Undo — Revert button.
 pub const UNDO: &str = "\u{e166}";
 /// Label — Label button.
@@ -39,11 +39,13 @@ pub const CLOSE: &str = "\u{e5cd}";
 pub const SWAP_HORIZ: &str = "\u{e8d4}";
 /// Content copy — Copy diff button.
 pub const COPY: &str = "\u{e14d}";
+/// Control point (⊕ circle-with-plus) — timeline badge of a version that belongs to a batch.
+pub const CONTROL_POINT: &str = "\u{e3ba}";
 
 /// (name in `.codepoints`, constant) — drives the cross-check test and the
 /// duplicate-codepoint check.
 #[cfg_attr(not(test), allow(dead_code))]
-pub const ALL: [(&str, &str); 12] = [
+pub const ALL: [(&str, &str); 13] = [
     ("undo", UNDO),
     ("label", LABEL),
     ("add", ADD),
@@ -56,6 +58,7 @@ pub const ALL: [(&str, &str); 12] = [
     ("close", CLOSE),
     ("swap_horiz", SWAP_HORIZ),
     ("content_copy", COPY),
+    ("control_point", CONTROL_POINT),
 ];
 
 /// Registers Material Icons in the Proportional family with `Lowest` priority

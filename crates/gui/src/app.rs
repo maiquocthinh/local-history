@@ -1,13 +1,17 @@
-//! GUI application: three-pane layout (workspace + file list on the left,
-//! timeline on the right, diff in the center). Data is polled from the engine
-//! once per second; revert/label writes go through a dedicated per-operation
-//! write connection.
+//! GUI application: three-pane layout (workspace + a tabbed file/activity
+//! list on the left, timeline on the right, diff in the center). Data is
+//! polled from the engine once per second; revert/label writes and whole-batch
+//! reverts go through a dedicated per-operation write connection.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use history::{EventKind, FileSummary, LocalHistory, Version, VersionId, WorkspaceId};
+use history::{
+    BatchEntry, BatchId, BatchSummary, EventKind, FileSummary, LocalHistory, RevertReport, Version,
+    VersionId, WorkspaceId,
+};
 use rust_i18n::t;
 use time::{Date, OffsetDateTime, UtcOffset};
 
@@ -16,6 +20,18 @@ use crate::icons;
 use crate::state::{self, GuiState, LangPref};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Max batches listed in the activity tab (plan M6 §3.6).
+const BATCH_LIST_LIMIT: u32 = 50;
+
+/// Which tab the left panel shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftTab {
+    /// Tracked files (search box + file list).
+    Files,
+    /// Batch activity ("Hoạt động") — batch list with a whole-batch revert.
+    Activity,
+}
 
 /// Which pair of contents the diff compares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +179,17 @@ pub struct App {
     pub selected_file: Option<String>,
     pub versions: Vec<Version>,
     pub selected_version: Option<VersionId>,
+    // left panel tabs + batches ("Hoạt động" tab, plan M6 §3.6)
+    pub left_tab: LeftTab,
+    /// Latest batches of the current workspace, newest first (capped at 50).
+    pub batches: Vec<BatchSummary>,
+    /// Batch selected in the activity tab.
+    pub selected_batch: Option<BatchId>,
+    /// Versions of the selected batch, reloaded on each poll.
+    pub batch_entries: Vec<BatchEntry>,
+    /// `version_id -> batch_id` of the selected file — the timeline ⊕ badge
+    /// (`batch_map_for_file`; `struct Version` stays untouched).
+    pub batch_versions: HashMap<VersionId, BatchId>,
     // timeline filters
     pub kind_filter: Option<EventKind>,
     pub label_filter: String,
@@ -177,6 +204,8 @@ pub struct App {
     pub diff_selection: TextSelection,
     // pending modal actions
     pub confirm_revert: Option<ConfirmRevert>,
+    /// A whole-batch revert awaiting confirmation in the modal.
+    pub confirm_revert_batch: Option<BatchSummary>,
     pub label_edit_open: bool,
     pub label_draft: String,
     pub status: Status,
@@ -229,6 +258,11 @@ impl App {
             selected_file: None,
             versions: Vec::new(),
             selected_version: None,
+            left_tab: LeftTab::Files,
+            batches: Vec::new(),
+            selected_batch: None,
+            batch_entries: Vec::new(),
+            batch_versions: HashMap::new(),
             kind_filter: None,
             label_filter: String::new(),
             file_search: String::new(),
@@ -238,6 +272,7 @@ impl App {
             diff_cache: None,
             diff_selection: TextSelection::default(),
             confirm_revert: None,
+            confirm_revert_batch: None,
             label_edit_open: false,
             label_draft: String::new(),
             status: Status { text: t!("status.ready").to_string(), ok: true },
@@ -376,6 +411,34 @@ impl App {
             self.force_refresh = false;
             self.on_data_changed();
         }
+
+        // batches ("Hoạt động" tab) + the selected batch's entries — cheap
+        // capped queries, refreshed on the same 1s poll as the file list
+        let batches = if let Some(store) = self.ro.as_ref() {
+            store.batches(ws, BATCH_LIST_LIMIT)
+        } else {
+            return;
+        };
+        match batches {
+            Ok(b) => self.batches = b,
+            Err(e) => self.set_status(t!("batch.err_list", e = e).to_string(), false),
+        }
+        if let Some(id) = self.selected_batch {
+            let entries = if let Some(store) = self.ro.as_ref() {
+                store.batch_entries(id)
+            } else {
+                return;
+            };
+            match entries {
+                Ok(list) => self.batch_entries = list,
+                Err(history::Error::NotFound(_)) => {
+                    // the batch vanished (GC'd / store switched) — drop the selection
+                    self.selected_batch = None;
+                    self.batch_entries.clear();
+                }
+                Err(e) => self.set_status(t!("batch.err_list", e = e).to_string(), false),
+            }
+        }
     }
 
     /// Handles freshly changed data (a new token seen by a poll, or a forced refresh).
@@ -404,17 +467,22 @@ impl App {
     }
 
     /// Reloads the versions of the selected file (content is NOT loaded here —
-    /// only when a diff pair is built).
+    /// only when a diff pair is built) plus the file's version→batch map for
+    /// the timeline badge.
     fn refresh_versions(&mut self) {
         let Some(ws) = self.current_ws else { return };
         let Some(rel) = self.selected_file.clone() else {
             self.versions.clear();
             self.selected_version = None;
+            self.batch_versions.clear();
             return;
         };
         let Some(store) = self.ro.as_ref() else { return };
         let file = self.ws_file_path(ws, &rel);
-        match store.history(ws, &file) {
+        // both queries run before any status write — `store` borrows self.ro
+        let hist = store.history(ws, &file);
+        let badge_map = store.batch_map_for_file(ws, &file);
+        match hist {
             Ok(vs) => {
                 self.versions = vs;
                 if let Some(sel) = self.selected_version {
@@ -426,6 +494,14 @@ impl App {
                 }
             }
             Err(e) => self.set_status(t!("err.history", e = e).to_string(), false),
+        }
+        match badge_map {
+            Ok(m) => self.batch_versions = m,
+            Err(e) => {
+                // badge data only — report it, but never block the timeline
+                self.batch_versions.clear();
+                self.set_status(t!("batch.err_map", e = e).to_string(), false);
+            }
         }
     }
 
@@ -442,6 +518,10 @@ impl App {
         self.versions.clear();
         self.selected_file = None;
         self.selected_version = None;
+        self.batches.clear();
+        self.selected_batch = None;
+        self.batch_entries.clear();
+        self.batch_versions.clear();
         self.diff_cache = None;
         self.last_token = 0;
         if let Some((_, root)) = self.workspaces.iter().find(|(wid, _)| *wid == id) {
@@ -464,6 +544,10 @@ impl App {
         self.versions.clear();
         self.selected_file = None;
         self.selected_version = None;
+        self.batches.clear();
+        self.selected_batch = None;
+        self.batch_entries.clear();
+        self.batch_versions.clear();
         self.diff_cache = None;
         self.last_token = 0;
         self.force_refresh = true;
@@ -529,6 +613,24 @@ impl App {
                 }
             }
             Err(e) => self.set_status(t!("err.revert", e = e).to_string(), false),
+        }
+    }
+
+    /// Whole-batch revert from the activity tab (plan M6 §3.6): dedicated write
+    /// connection per operation, `force = false` — files edited after the batch
+    /// are skipped (and reported), never clobbered.
+    fn do_revert_batch(&mut self, batch: BatchSummary) {
+        self.confirm_revert_batch = None;
+        let res = LocalHistory::open(&self.store_root)
+            .map_err(|e| e.to_string())
+            .and_then(|store| store.revert_batch(batch.id, false).map_err(|e| e.to_string()));
+        match res {
+            Ok(report) => {
+                self.set_status(format_revert_report(&report), report.errors.is_empty());
+                self.force_refresh = true;
+                self.next_poll = None; // reload versions + batches on the next frame
+            }
+            Err(e) => self.set_status(t!("batch.err_revert", e = e).to_string(), false),
         }
     }
 
@@ -702,6 +804,30 @@ impl App {
             });
         ui.separator();
 
+        // tab bar: tracked files | batch activity (plan M6 §3.6)
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(self.left_tab == LeftTab::Files, t!("batch.tab_files"))
+                .clicked()
+            {
+                self.left_tab = LeftTab::Files;
+            }
+            if ui
+                .selectable_label(self.left_tab == LeftTab::Activity, t!("batch.tab_activity"))
+                .clicked()
+            {
+                self.left_tab = LeftTab::Activity;
+            }
+        });
+        ui.separator();
+        match self.left_tab {
+            LeftTab::Files => self.files_tab(ui),
+            LeftTab::Activity => self.activity_tab(ui),
+        }
+    }
+
+    /// "Files" tab: search box + the tracked-file list.
+    fn files_tab(&mut self, ui: &mut egui::Ui) {
         ui.add(
             egui::TextEdit::singleline(&mut self.file_search)
                 .hint_text(format!("{} {}", icons::SEARCH, t!("panel.search_hint")))
@@ -778,6 +904,107 @@ impl App {
         // kind-colored dot for the latest event, top-right
         p.circle_filled(egui::pos2(rect.right() - 10.0, rect.top() + 10.0), 3.5, state::kind_color(f.last_kind));
         resp.on_hover_text(f.rel_path.as_str())
+    }
+
+    /// "Activity" tab: batch list; selecting a batch shows its entries plus a
+    /// whole-batch revert button (plan M6 §3.6).
+    fn activity_tab(&mut self, ui: &mut egui::Ui) {
+        let now = (state::local_now().unix_timestamp_nanos() / 1000) as i64;
+        let offset = state::local_utc_offset();
+        egui::ScrollArea::vertical()
+            .id_salt("batch_list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if self.batches.is_empty() {
+                    ui.weak(t!("batch.empty"));
+                }
+                for i in 0..self.batches.len() {
+                    let b = self.batches[i].clone();
+                    let selected = self.selected_batch == Some(b.id);
+                    if self.batch_row(ui, &b, selected, now, offset).clicked() {
+                        self.selected_batch = Some(b.id);
+                        self.batch_entries.clear();
+                        self.next_poll = None; // load the entries on the next frame
+                    }
+                }
+            });
+
+        // details of the selected batch: header (entries count + revert) + entry list
+        if let Some(id) = self.selected_batch {
+            ui.separator();
+            ui.horizontal(|ui| {
+                let count = self
+                    .batches
+                    .iter()
+                    .find(|b| b.id == id)
+                    .map(|b| b.file_count)
+                    .unwrap_or(0);
+                ui.strong(t!("batch.entries_title", id = id, count = file_count_text(count)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(egui::RichText::new(format!(
+                            "{} {}",
+                            icons::UNDO,
+                            t!("batch.btn_revert_all")
+                        )))
+                        .clicked()
+                    {
+                        self.confirm_revert_batch =
+                            self.batches.iter().find(|b| b.id == id).cloned();
+                    }
+                });
+            });
+            egui::ScrollArea::vertical()
+                .id_salt("batch_entries")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for e in &self.batch_entries {
+                        let (rel, meta) = batch_entry_row(e);
+                        ui.horizontal(|ui| {
+                            ui.label(rel);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.small(meta);
+                            });
+                        });
+                    }
+                    if self.batch_entries.is_empty() {
+                        ui.weak(t!("batch.no_entries"));
+                    }
+                });
+        }
+    }
+
+    /// One batch row: relative start time · file count · label-or-kind.
+    fn batch_row(
+        &self,
+        ui: &mut egui::Ui,
+        b: &BatchSummary,
+        selected: bool,
+        now_micros: i64,
+        offset: UtcOffset,
+    ) -> egui::Response {
+        let h = 30.0;
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click());
+        if selected {
+            ui.painter()
+                .rect_filled(rect, 4.0, ui.visuals().selection.bg_fill.gamma_multiply(0.6));
+        } else if resp.hovered() {
+            ui.painter()
+                .rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
+        }
+        let p = ui.painter_at(rect);
+        let text = batch_row_text(b, now_micros, offset);
+        p.text(
+            egui::pos2(rect.left() + 6.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            text,
+            egui::FontId::proportional(12.5),
+            egui::Color32::from_rgb(225, 225, 225),
+        );
+        resp.on_hover_text(
+            t!("batch.entries_title", id = b.id, count = file_count_text(b.file_count)).to_string(),
+        )
     }
 
     fn timeline_panel(&mut self, ui: &mut egui::Ui) {
@@ -956,10 +1183,25 @@ impl App {
         );
         p.galley(egui::pos2(bx + pad, y - galley.size().y / 2.0), galley, kind_col);
         // label (italic, light purple)
+        let mut after_label = bx + bw + 8.0;
         if let Some(label) = &v.label {
             let label_col = egui::Color32::from_rgb(200, 180, 240);
             let g = p.layout_no_wrap(label.clone(), egui::FontId::proportional(12.5), label_col);
-            p.galley(egui::pos2(bx + bw + 8.0, y - g.size().y / 2.0), g, label_col);
+            let advance = g.size().x + 8.0;
+            p.galley(egui::pos2(after_label, y - g.size().y / 2.0), g, label_col);
+            after_label += advance;
+        }
+        // ⊕N badge: the version belongs to a batch (plan M6 §3.6) — N = files
+        // in that batch; data from batch_map_for_file, count from the batch list
+        if let Some(&bid) = self.batch_versions.get(&v.id) {
+            let count = self.batches.iter().find(|b| b.id == bid).map(|b| b.file_count);
+            let badge = match count {
+                Some(c) => format!("{}{c}", icons::CONTROL_POINT),
+                None => icons::CONTROL_POINT.to_string(),
+            };
+            let badge_col = egui::Color32::from_rgb(120, 190, 240);
+            let g = p.layout_no_wrap(badge, egui::FontId::proportional(12.0), badge_col);
+            p.galley(egui::pos2(after_label, y - g.size().y / 2.0), g, badge_col);
         }
         // storage + size, right-aligned
         let right = format!("{} · {}", v.storage.as_str(), state::human_size(v.size));
@@ -970,13 +1212,26 @@ impl App {
             egui::FontId::proportional(11.0),
             dim,
         );
-        let tip = t!(
+        let mut tip = t!(
             "tip.version",
             seq = v.seq,
             kind = v.kind.as_str(),
             hash = &v.content_hash[..v.content_hash.len().min(8)]
-        );
-        resp.on_hover_text(tip.to_string())
+        )
+        .to_string();
+        if let Some(&bid) = self.batch_versions.get(&v.id) {
+            let count = self
+                .batches
+                .iter()
+                .find(|b| b.id == bid)
+                .map(|b| b.file_count)
+                .unwrap_or(0);
+            tip.push_str(&format!(
+                "\n{}",
+                t!("batch.badge_tip", id = bid, count = file_count_text(count))
+            ));
+        }
+        resp.on_hover_text(tip)
     }
 
     fn diff_panel(&mut self, ui: &mut egui::Ui) {
@@ -1301,6 +1556,41 @@ impl App {
             }
         }
 
+        if let Some(b) = self.confirm_revert_batch.clone() {
+            let modal = egui::Modal::new(egui::Id::unique("confirm_revert_batch"));
+            let resp = modal.show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.strong(t!(
+                    "batch.confirm_text",
+                    id = b.id,
+                    count = file_count_text(b.file_count)
+                ));
+                ui.label(t!("batch.confirm_note"));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(egui::RichText::new(t!("batch.btn_revert_all")).strong())
+                        .clicked()
+                    {
+                        self.do_revert_batch(b.clone());
+                    }
+                    if ui
+                        .button(egui::RichText::new(format!(
+                            "{} {}",
+                            icons::CLOSE,
+                            t!("btn.cancel")
+                        )))
+                        .clicked()
+                    {
+                        self.confirm_revert_batch = None;
+                    }
+                });
+            });
+            if resp.backdrop_response.clicked() {
+                self.confirm_revert_batch = None;
+            }
+        }
+
         if self.label_edit_open {
             let modal = egui::Modal::new(egui::Id::unique("label_edit"));
             let resp = modal.show(ctx, |ui| {
@@ -1341,6 +1631,50 @@ impl App {
 fn version_title(v: &Version) -> String {
     let dt = state::unix_micros_to_local(v.timestamp_micros, state::local_utc_offset());
     format!("seq {} · {} · {}", v.seq, v.kind.as_str(), state::hhmm(dt))
+}
+
+/// Pre-formatted file count for batch rows ("1 file" / "6 files", i18n
+/// `batch.file_count*`).
+fn file_count_text(count: u64) -> String {
+    if count == 1 {
+        t!("batch.file_count_one", count = count).to_string()
+    } else {
+        t!("batch.file_count", count = count).to_string()
+    }
+}
+
+/// One batch-list row: relative start time · file count · label-or-kind
+/// (i18n `batch.row`; the batch's label wins over its technical kind).
+fn batch_row_text(b: &BatchSummary, now_micros: i64, offset: UtcOffset) -> String {
+    let ago = state::format_relative_time(b.started_at, now_micros, offset);
+    let kind = b.label.clone().unwrap_or_else(|| b.kind.clone());
+    t!("batch.row", ago = ago, count = file_count_text(b.file_count), kind = kind).to_string()
+}
+
+/// One batch-entry row: `(rel_path, "kind · size")`.
+fn batch_entry_row(e: &BatchEntry) -> (String, String) {
+    (
+        e.rel_path.clone(),
+        format!("{} · {}", e.version.kind.as_str(), state::human_size(e.version.size)),
+    )
+}
+
+/// Toast text for a whole-batch revert: the [`RevertReport`] counters plus the
+/// per-file error count (`batch.report*`).
+fn format_revert_report(r: &RevertReport) -> String {
+    let base = t!(
+        "batch.report",
+        reverted = r.reverted,
+        restored = r.restored,
+        deleted = r.deleted,
+        skipped = r.skipped
+    )
+    .to_string();
+    if r.errors.is_empty() {
+        base
+    } else {
+        format!("{base} · {}", t!("batch.report_errors", n = r.errors.len()))
+    }
 }
 
 impl eframe::App for App {
@@ -1451,5 +1785,104 @@ mod tests {
             resolve_ws_and_rel(&ws, Path::new(r"D:\project\a.rs")),
             None
         );
+    }
+
+    // ----- batch tab formatting (plan M6 §3.6 — pure part of the UI) -----
+
+    /// Builds a BatchSummary fixture: started = ended = `started`, one version per file.
+    fn batch(
+        id: i64,
+        started: i64,
+        files: u64,
+        kind: &str,
+        label: Option<&str>,
+    ) -> BatchSummary {
+        BatchSummary {
+            id,
+            ws_id: 1,
+            started_at: started,
+            ended_at: started,
+            kind: kind.to_string(),
+            label: label.map(String::from),
+            version_count: files,
+            file_count: files,
+        }
+    }
+
+    #[test]
+    fn batch_row_and_file_count_formatting() {
+        let _guard = crate::state::LOCALE_TEST_LOCK.lock().unwrap();
+        rust_i18n::set_locale("en");
+        let now = 1_800_000_000_000_000i64;
+        let utc = UtcOffset::UTC;
+        // a label wins over the technical kind
+        let b = batch(7, now - 5 * 60_000_000, 6, "auto", Some("deploy"));
+        assert_eq!(batch_row_text(&b, now, utc), "5 minutes ago · 6 files · deploy");
+        // no label → kind; singular file count
+        let b2 = batch(8, now - 30_000_000, 1, "auto", None);
+        assert_eq!(batch_row_text(&b2, now, utc), "just now · 1 file · auto");
+        assert_eq!(file_count_text(1), "1 file");
+        assert_eq!(file_count_text(6), "6 files");
+        // relative time buckets are reused from format_relative_time
+        let b3 = batch(9, now - 3 * 3_600_000_000, 2, "manual", None);
+        assert_eq!(batch_row_text(&b3, now, utc), "3 hours ago · 2 files · manual");
+        // vi locale
+        rust_i18n::set_locale("vi");
+        assert_eq!(batch_row_text(&b, now, utc), "5 phút trước · 6 file · deploy");
+        assert_eq!(batch_row_text(&b2, now, utc), "vừa xong · 1 file · auto");
+        rust_i18n::set_locale("en"); // restore the default for other tests
+    }
+
+    #[test]
+    fn batch_entry_row_is_rel_path_plus_kind_and_size() {
+        let mut v = ver(10, 1);
+        v.kind = EventKind::External;
+        v.size = 1536;
+        let e = BatchEntry { rel_path: "src/main.rs".to_string(), version: v };
+        assert_eq!(batch_entry_row(&e), ("src/main.rs".to_string(), "external · 1.5 KB".to_string()));
+    }
+
+    #[test]
+    fn revert_report_toast_text() {
+        let _guard = crate::state::LOCALE_TEST_LOCK.lock().unwrap();
+        rust_i18n::set_locale("en");
+        let mut r = RevertReport {
+            reverted: 3,
+            restored: 1,
+            deleted: 2,
+            skipped: 4,
+            errors: Vec::new(),
+        };
+        assert_eq!(
+            format_revert_report(&r),
+            "batch reverted — 3 reverted · 1 restored · 2 deleted · 4 skipped"
+        );
+        // a failing file appends the error count to the same toast
+        r.errors.push(("a.txt".to_string(), "boom".to_string()));
+        assert_eq!(
+            format_revert_report(&r),
+            "batch reverted — 3 reverted · 1 restored · 2 deleted · 4 skipped · 1 file(s) failed"
+        );
+        rust_i18n::set_locale("vi");
+        assert_eq!(
+            format_revert_report(&r),
+            "đã revert cả đợt — 3 revert · 1 khôi phục · 2 xóa · 4 bỏ qua · 1 file lỗi"
+        );
+        rust_i18n::set_locale("en"); // restore the default for other tests
+    }
+
+    #[test]
+    fn revert_report_error_count_matches_entries() {
+        let _guard = crate::state::LOCALE_TEST_LOCK.lock().unwrap();
+        rust_i18n::set_locale("en");
+        let r = RevertReport {
+            errors: vec![
+                ("a.txt".to_string(), "x".to_string()),
+                ("b.txt".to_string(), "y".to_string()),
+            ],
+            ..Default::default()
+        };
+        assert!(format_revert_report(&r).ends_with("2 file(s) failed"));
+        rust_i18n::set_locale("en"); // restore the default for other tests
     }
 }

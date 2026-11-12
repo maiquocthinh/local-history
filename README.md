@@ -8,7 +8,9 @@ khẩn cấp** ("undo thay đổi 5 ngày trước"), không phải VCS và khô
 
 Phase 1 hoàn tất với **một exe đa năng `lh.exe`** (mô hình `gh`/`uv`): bare `lh` mở GUI,
 watcher daemon chạy qua `lh daemon`, GUI foreground qua `lh gui`, self-update qua
-`lh self-update` — 9 lệnh CLI giữ nguyên hành vi. Hai wrapper `lh-gui.exe`/`lh-daemon.exe`
+`lh self-update` — 9 lệnh CLI giữ nguyên hành vi. Batch grouping (M6) thêm 3 lệnh
+`lh batches` / `lh batch <id>` / `lh revert-batch <id>` — xem và revert cả đợt thay đổi
+1 lệnh. Hai wrapper `lh-gui.exe`/`lh-daemon.exe`
 chỉ còn là binary mỏng cho dev/smoke/editor (dev-compat). Toàn bộ test workspace pass
 (`cargo test --workspace`), smoke end-to-end xanh (`scripts\smoke.ps1`).
 
@@ -30,7 +32,7 @@ trong đó. Hai wrapper mỏng `lh-gui.exe` / `lh-daemon.exe` giữ lại cho de
 |---|---|---|
 | `crates/history` | — (lib) | Engine: version chain (full + delta nén zstd), reconstruct, diff, revert, label, GC |
 | `crates/daemon` | lib nhúng vào `lh` + wrapper `lh-daemon` | Watcher daemon (native fs events + debounce), chạy console hoặc `--tray` trong system tray — qua `lh daemon` |
-| `crates/cli` | **`lh`** | Entry đa năng: 9 lệnh CLI (`status`, `history`, `show`, `diff`, `revert`, `label`, `gc`, `workspaces`, `ui`) + `lh gui`, `lh daemon`, `lh self-update` — đều có `--json` |
+| `crates/cli` | **`lh`** | Entry đa năng: 12 lệnh CLI (`status`, `history`, `show`, `diff`, `revert`, `label`, `gc`, `batches`, `batch`, `revert-batch`, `workspaces`, `ui`) + `lh gui`, `lh daemon`, `lh self-update` — đều có `--json` |
 | `crates/gui` | lib nhúng vào `lh` + wrapper `lh-gui` | App desktop (egui): chọn workspace + file list, timeline, diff side-by-side, revert 1 click |
 | `crates/updater` | — (lib) | Self-update engine: manifest đa artifact + sha256 bắt buộc, swap metadata-only với rollback + auto-restore |
 
@@ -53,6 +55,12 @@ target\release\lh diff   D:\path\to\project\src\main.rs 1 2
 target\release\lh show   D:\path\to\project\src\main.rs --at 1
 target\release\lh label  D:\path\to\project\src\main.rs "before refactor"
 target\release\lh revert D:\path\to\project\src\main.rs --at 1 --yes
+
+:: đợt thay đổi (batch) — gom nhóm các file sửa gần nhau trong thời gian, xem và revert cả đợt
+target\release\lh batches
+target\release\lh batch 2
+target\release\lh revert-batch 2 --yes
+
 target\release\lh gc --dry-run
 target\release\lh status
 

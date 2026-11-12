@@ -17,6 +17,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OpenFlags};
 
+use crate::batch::BatchPolicy;
 use crate::model::*;
 
 /// A local-history store: a SQLite index plus blob files under one root directory.
@@ -24,6 +25,8 @@ use crate::model::*;
 pub struct LocalHistory {
     pub(crate) conn: Mutex<Connection>,
     pub(crate) root: PathBuf,
+    /// Auto-batch policy (sliding window + timeout), runtime-tunable via `set_batch_policy`.
+    pub(crate) batch_policy: Mutex<BatchPolicy>,
 }
 
 const MIGRATION_V1: &str = r#"
@@ -59,6 +62,24 @@ CREATE INDEX idx_files_ws ON files(workspace_id, rel_path);
 CREATE INDEX idx_versions_file ON versions(file_id, seq);
 "#;
 
+/// Schema v2 (plan M6 §3.1): batch grouping. Pure ADD COLUMN / CREATE TABLE — a v1 database
+/// keeps all its data; old versions simply have `batch_id NULL`.
+const MIGRATION_V2: &str = r#"
+CREATE TABLE batches (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id INTEGER NOT NULL REFERENCES workspaces(id),
+  started_at   INTEGER NOT NULL,
+  ended_at     INTEGER NOT NULL,
+  kind         TEXT NOT NULL DEFAULT 'auto',
+  label        TEXT,
+  closed_at    INTEGER
+);
+
+ALTER TABLE versions ADD COLUMN batch_id INTEGER REFERENCES batches(id);
+
+CREATE INDEX idx_batches_ws ON batches(workspace_id, started_at DESC);
+"#;
+
 impl LocalHistory {
     /// Opens (or creates) the store at `root`, creating directories and schema as needed.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -67,7 +88,7 @@ impl LocalHistory {
         let conn = Connection::open(root.join("index.db"))?;
         Self::init_conn(&conn)?;
         Self::migrate(&conn)?;
-        Ok(Self { conn: Mutex::new(conn), root })
+        Ok(Self { conn: Mutex::new(conn), root, batch_policy: Mutex::new(BatchPolicy::default()) })
     }
 
     /// Opens the store at `default_root()`.
@@ -85,7 +106,7 @@ impl LocalHistory {
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        Ok(Self { conn: Mutex::new(conn), root })
+        Ok(Self { conn: Mutex::new(conn), root, batch_policy: Mutex::new(BatchPolicy::default()) })
     }
 
     /// Default store root: `%LOCALAPPDATA%\local-history` (Windows), overridable via the
@@ -120,7 +141,21 @@ impl LocalHistory {
             conn.execute_batch(MIGRATION_V1)?;
             conn.pragma_update(None, "user_version", 1)?;
         }
+        if version < 2 {
+            conn.execute_batch(MIGRATION_V2)?;
+            conn.pragma_update(None, "user_version", 2)?;
+        }
         Ok(())
+    }
+
+    /// Overrides the auto-batch policy: `window_ms` is the sliding window that keeps a batch
+    /// open (`now - ended_at <= window_ms`), `timeout_ms` is reserved for the manual
+    /// open/close lifecycle (a later phase — the lazy lifecycle derives everything from the
+    /// window). Defaults: 3000/5000. Tests set small values (e.g. 200/400) on the real clock.
+    pub fn set_batch_policy(&self, window_ms: u64, timeout_ms: u64) {
+        let mut policy = self.batch_policy.lock().unwrap();
+        policy.window_ms = window_ms;
+        policy.timeout_ms = timeout_ms;
     }
 
     /// Registers a workspace. The id is deterministic from the canonical root — calling
@@ -470,16 +505,33 @@ mod tests {
         let (_d, store) = tmp_store();
         let conn = store.conn.lock().unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 1);
-        // the three tables exist
+        assert_eq!(v, 2);
+        // the four tables exist (v2 adds `batches`)
         let n: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('workspaces','files','versions')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('workspaces','files','versions','batches')",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(n, 3);
+        assert_eq!(n, 4);
+        // versions gained batch_id, and the batches index exists
+        let cols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('versions') WHERE name = 'batch_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cols, 1);
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name = 'idx_batches_ws'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
     }
 
     #[test]
@@ -537,5 +589,107 @@ mod tests {
         assert!(ro.all_workspaces().unwrap().len() == 1);
         // read-only cannot write
         assert!(ro.register_workspace(wsdir.path()).is_err());
+    }
+
+    /// A v1 database (built by hand with MIGRATION_V1, seeded with old rows) opens cleanly:
+    /// it migrates to user_version 2, gains the `batches` table + `versions.batch_id` column,
+    /// keeps the old rows with `batch_id NULL`, and still serves the pre-batch queries.
+    #[test]
+    fn migrate_v1_db_preserves_data() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = Connection::open(dir.path().join("index.db")).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute(
+                "INSERT INTO workspaces (id, root, created_at) VALUES (1, 'C:/ws-old', 111)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files (id, workspace_id, rel_path, current_seq) VALUES (10, 1, 'old.txt', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO versions (id, file_id, seq, timestamp, kind, label, storage, base_seq, size, content_hash)
+                 VALUES (100, 10, 1, 222, 'external', NULL, 'full', NULL, 3, 'abc')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = LocalHistory::open(dir.path()).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, 2);
+            // old data intact, batch_id NULL
+            let (cnt, nulls): (i64, i64) = conn
+                .query_row(
+                    "SELECT COUNT(*), SUM(batch_id IS NULL) FROM versions",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((cnt, nulls), (1, 1));
+            let batches: i64 = conn
+                .query_row("SELECT COUNT(*) FROM batches", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(batches, 0);
+        }
+        // the old query API still works on the migrated schema: record into the same store
+        let ws = store.register_workspace(dir.path()).unwrap();
+        let f = dir.path().join("new.txt");
+        let id = store
+            .record(ws, &f, b"after migration", EventKind::External, None)
+            .unwrap()
+            .unwrap();
+        let hist = store.history(ws, &f).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].id, id);
+        // and the new version IS auto-batched (old row stays unbatched)
+        let batches = store.batches(ws, 10).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].version_count, 1);
+    }
+
+    /// A v1 database opened READ-ONLY (the CLI read commands / GUI poll path — no
+    /// migration runs there) serves the batch queries with empty results instead of raw
+    /// SQLite errors (plan M6 acceptance #6). Migration itself stays on the rw `open`
+    /// path (see `migrate_v1_db_preserves_data`).
+    #[test]
+    fn open_read_only_v1_degrades_batch_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = Connection::open(dir.path().join("index.db")).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            let root = normalize_canonical(dir.path()).unwrap().to_string_lossy().to_string();
+            conn.execute(
+                "INSERT INTO workspaces (id, root, created_at) VALUES (1, ?1, 111)",
+                rusqlite::params![root],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files (id, workspace_id, rel_path, current_seq) VALUES (10, 1, 'old.txt', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO versions (id, file_id, seq, timestamp, kind, label, storage, base_seq, size, content_hash)
+                 VALUES (100, 10, 1, 222, 'external', NULL, 'full', NULL, 3, 'abc')",
+                [],
+            )
+            .unwrap();
+        }
+        let ro = LocalHistory::open_read_only(dir.path()).unwrap();
+        let old = dir.path().join("old.txt");
+        // batch reads degrade — a v1 store has no batches by definition
+        assert!(ro.batches(1, 50).unwrap().is_empty());
+        assert!(matches!(ro.batch_entries(1), Err(Error::NotFound(_))));
+        assert!(ro.batch_map_for_file(1, &old).unwrap().is_empty());
+        // the pre-batch read surface is unaffected on the same read-only connection
+        assert_eq!(ro.history(1, &old).unwrap().len(), 1);
+        assert_eq!(ro.list_files(1, None).unwrap().len(), 1);
     }
 }

@@ -123,10 +123,6 @@ mod tests {
         assert!(p.ends_with("gui"));
     }
 
-    /// `set_locale` is process-global state — this lock keeps locale-switching
-    /// tests from racing tests that read messages.
-    static LOCALE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn i18n_lookup_vi_and_en() {
         // explicit-locale lookups — process-global state untouched
@@ -154,7 +150,8 @@ mod tests {
 
     #[test]
     fn i18n_invalid_locale_falls_back_to_en() {
-        let _guard = LOCALE_TEST_LOCK.lock().unwrap();
+        // the process-global locale is shared state — serialize via the shared lock
+        let _guard = crate::state::LOCALE_TEST_LOCK.lock().unwrap();
         // a locale absent from locales/*.yml falls back to "en"
         rust_i18n::set_locale("fr");
         assert_eq!(t!("panel.search_hint"), "Search files…");

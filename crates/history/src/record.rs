@@ -11,6 +11,7 @@
 
 use std::path::Path;
 
+use crate::batch::BatchId;
 use crate::model::*;
 use crate::patch;
 use crate::store::{now_micros, row_to_version, LocalHistory};
@@ -145,6 +146,7 @@ impl LocalHistory {
         // Transaction: INSERT files (if missing) → INSERT versions → write blob →
         // UPDATE current_seq → COMMIT. A blob failure rolls back; a crash only leaves an
         // orphan blob for GC.
+        let ts = now_micros();
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
@@ -165,7 +167,7 @@ impl LocalHistory {
             rusqlite::params![
                 file_id,
                 seq,
-                now_micros(),
+                ts,
                 kind.as_str(),
                 label,
                 storage.as_str(),
@@ -188,7 +190,76 @@ impl LocalHistory {
             rusqlite::params![seq, file_id],
         )?;
         tx.commit()?;
+        // Release the connection lock before assigning the batch — `assign_batch` re-locks
+        // the same non-reentrant mutex, and the version is already committed at this point.
+        drop(conn);
+        // Auto-batch (plan M6 §3.2, lazy lifecycle): best-effort, AFTER the version is
+        // committed — a batch failure must never fail the record; the version simply stays
+        // with `batch_id NULL`.
+        self.assign_batch(ws, version_id, ts);
         Ok(Some(version_id))
+    }
+
+    /// Attaches the committed version to the open batch of `ws`, creating a batch when
+    /// there is none.
+    ///
+    /// Lazy lifecycle (plan M6 §3.2 — deliberate deviation from architecture §10.2/10.3):
+    /// there is no timer thread. A batch is "open" while the newest batch of the workspace
+    /// has `closed_at NULL` and `ts - ended_at <= window_ms`; a record past the window (or
+    /// from a different workspace) lazily closes the previous batch (`closed_at`) and starts
+    /// a fresh one. `ended_at` always equals the timestamp of the batch's newest version.
+    pub(crate) fn assign_batch(&self, ws: WorkspaceId, version_id: VersionId, ts: i64) {
+        if let Err(e) = self.try_assign_batch(ws, version_id, ts) {
+            log::warn!("gắn batch thất bại cho version {version_id}: {e}");
+        }
+    }
+
+    fn try_assign_batch(&self, ws: WorkspaceId, version_id: VersionId, ts: i64) -> Result<()> {
+        let window_micros = self.batch_policy.lock().unwrap().window_ms as i64 * 1000;
+        let conn = self.conn.lock().unwrap();
+        let latest: Option<(BatchId, i64, Option<i64>)> = match conn.query_row(
+            "SELECT id, ended_at, closed_at FROM batches WHERE workspace_id = ?1
+             ORDER BY started_at DESC, id DESC LIMIT 1",
+            [ws],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ) {
+            Ok(row) => Some(row),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
+        // Newest batch of the workspace still inside the window and not closed → join it and
+        // slide its end forward.
+        if let Some((batch_id, ended_at, None)) = &latest
+            && ts - ended_at <= window_micros
+        {
+            conn.execute(
+                "UPDATE versions SET batch_id = ?1 WHERE id = ?2",
+                rusqlite::params![batch_id, version_id],
+            )?;
+            conn.execute(
+                "UPDATE batches SET ended_at = ?1 WHERE id = ?2",
+                rusqlite::params![ts, batch_id],
+            )?;
+            return Ok(());
+        }
+        // Not joinable: lazily close the previous batch if nobody did yet, then open a new
+        // one for this record.
+        if let Some((batch_id, _, None)) = &latest {
+            conn.execute(
+                "UPDATE batches SET closed_at = ?1 WHERE id = ?2 AND closed_at IS NULL",
+                rusqlite::params![ts, batch_id],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO batches (workspace_id, started_at, ended_at, kind) VALUES (?1, ?2, ?3, 'auto')",
+            rusqlite::params![ws, ts, ts],
+        )?;
+        let batch_id: BatchId = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE versions SET batch_id = ?1 WHERE id = ?2",
+            rusqlite::params![batch_id, version_id],
+        )?;
+        Ok(())
     }
 
     /// Reverts `file` to the content of `version_id`.

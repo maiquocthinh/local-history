@@ -2,7 +2,8 @@
 //!
 //! One binary, several faces (the `gh`/`uv` model):
 //! - the 9 storage subcommands (status/history/show/diff/revert/label/gc/workspaces/ui)
-//!   keep their behavior unchanged;
+//!   keep their behavior unchanged; batches/batch/revert-batch add the batch-grouping
+//!   surface (plan M6 §3.5 — list waves of changes, inspect one, revert it whole);
 //! - `gui` runs the GUI in-process (foreground); `ui` still takes an optional
 //!   positional FILE and opens the GUI detached by re-invoking this binary with
 //!   `gui` (no sibling `lh-gui.exe` needed anymore);
@@ -44,7 +45,10 @@ use serde_json::json;
 // Load translations from crates/cli/locales (embedded at compile time); missing keys fall back to en.
 rust_i18n::i18n!("locales", fallback = "en");
 
-use history::{EventKind, LocalHistory, RetentionPolicy, Version, WorkspaceId};
+use history::{
+    BatchEntry, BatchSummary, EventKind, LocalHistory, RevertReport, RetentionPolicy, Version,
+    WorkspaceId,
+};
 
 /// Result type shared by all fallible helpers in this crate: every failure becomes a `CliError`.
 pub type Result<T> = std::result::Result<T, CliError>;
@@ -181,6 +185,28 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Batches — groups of changes recorded close in time (`lh batch <id>` inspects one)
+    Batches {
+        /// Max batches per workspace (default 50)
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+    },
+    /// Every version of every file inside one batch
+    Batch {
+        /// Batch id, from `lh batches`
+        id: u32,
+    },
+    /// Revert every file of a batch to its state before the batch (records pre_revert per file)
+    RevertBatch {
+        /// Batch id, from `lh batches`
+        id: u32,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+        /// Revert files edited after the batch too (their newer content stays in history)
+        #[arg(long)]
+        force: bool,
+    },
     /// Workspaces registered in the store
     Workspaces,
     /// Launch the GUI detached — returns immediately (positional FILE, like before)
@@ -313,6 +339,11 @@ fn dispatch(cli: &Cli) -> Result<()> {
         Some(Command::Revert { file, at, yes }) => cmd_revert(cli, file, at, *yes),
         Some(Command::Label { file, text }) => cmd_label(cli, file, text),
         Some(Command::Gc { dry_run }) => cmd_gc(cli, *dry_run),
+        Some(Command::Batches { limit }) => cmd_batches(cli, *limit),
+        Some(Command::Batch { id }) => cmd_batch(cli, *id),
+        Some(Command::RevertBatch { id, yes, force }) => {
+            cmd_revert_batch(cli, *id, *yes, *force)
+        }
         Some(Command::Workspaces) => cmd_workspaces(cli),
         Some(Command::Ui { file }) => spawn_gui(cli.json, file.as_deref()),
         Some(Command::Gui { file }) => cmd_gui(file.as_deref()),
@@ -778,6 +809,266 @@ fn cmd_workspaces(cli: &Cli) -> Result<()> {
     }
     println!("{}", t!("ws.header", root = root.display()));
     print_table(&ws_header(), &ws_rows(&overview));
+    Ok(())
+}
+
+// ---------- batch commands (plan M6 §3.5) ----------
+
+/// Row cap for `lh batches` when `--limit` is absent — per workspace, like the GUI's
+/// batch list.
+const BATCHES_DEFAULT_LIMIT: u32 = 50;
+
+/// One `lh batches` row: the engine summary tagged with the workspace it belongs to
+/// (required as soon as the store holds more than one workspace).
+#[derive(Debug, Clone)]
+pub struct WsBatch {
+    pub ws: WorkspaceId,
+    pub root: PathBuf,
+    pub batch: BatchSummary,
+}
+
+/// The workspace resolution of `lh batches` (plan M6 §3.5): one registered workspace →
+/// its batches; several → every workspace's batches (up to `limit` each), merged
+/// newest-first (`started_at` desc, `id` desc as the tie-break). No registered workspace
+/// → empty list (the caller prints the empty state).
+pub fn collect_batches(store: &LocalHistory, limit: u32) -> Result<Vec<WsBatch>> {
+    let mut out = Vec::new();
+    for (ws, root) in store.workspaces()? {
+        for b in store.batches(ws, limit)? {
+            out.push(WsBatch { ws, root: root.clone(), batch: b });
+        }
+    }
+    out.sort_by_key(|w| (std::cmp::Reverse(w.batch.started_at), std::cmp::Reverse(w.batch.id)));
+    Ok(out)
+}
+
+/// Time range of a batch: the started datetime; when the batch actually spans time, the
+/// end appended as `HH:MM:SS` (same day) or the full datetime (crossed midnight).
+fn format_range(started: i64, ended: i64) -> String {
+    let start = format_time(started);
+    if ended <= started {
+        return start;
+    }
+    let end = format_time(ended);
+    let end_short = if end[..10] == start[..10] { &end[11..] } else { end.as_str() };
+    format!("{start} → {end_short}")
+}
+
+/// `kind/label` cell of the batches table: the semantic label when set, else the kind.
+fn kind_label(b: &BatchSummary) -> String {
+    b.label.clone().unwrap_or_else(|| b.kind.clone())
+}
+
+/// Header of the `lh batches` table; the workspace column appears only when the store
+/// holds several workspaces (with one, every row would repeat the same root).
+fn batches_header(show_ws: bool) -> Vec<String> {
+    let mut h = vec![t!("batches.col.id").to_string()];
+    if show_ws {
+        h.push(t!("batches.col.ws").to_string());
+    }
+    h.extend([
+        t!("batches.col.time").to_string(),
+        t!("batches.col.files").to_string(),
+        t!("batches.col.kind").to_string(),
+    ]);
+    h
+}
+
+/// Body rows of the `lh batches` table (id, [ws,] time range, file count, kind/label).
+fn batches_rows(batches: &[WsBatch], show_ws: bool) -> Vec<Vec<String>> {
+    batches
+        .iter()
+        .map(|w| {
+            let mut row = vec![w.batch.id.to_string()];
+            if show_ws {
+                row.push(w.root.display().to_string());
+            }
+            row.extend([
+                format_range(w.batch.started_at, w.batch.ended_at),
+                w.batch.file_count.to_string(),
+                kind_label(&w.batch),
+            ]);
+            row
+        })
+        .collect()
+}
+
+/// `--json` shape of one batches row (plan M6 §3.5: `{ "batches": [...] }`): machine
+/// fields plus the formatted times and the workspace root.
+fn batch_summary_json(w: &WsBatch) -> serde_json::Value {
+    json!({
+        "id": w.batch.id,
+        "ws": w.root.display().to_string(),
+        "started": format_time(w.batch.started_at),
+        "ended": format_time(w.batch.ended_at),
+        "started_at": w.batch.started_at,
+        "ended_at": w.batch.ended_at,
+        "kind": w.batch.kind,
+        "label": w.batch.label,
+        "files": w.batch.file_count,
+        "versions": w.batch.version_count,
+    })
+}
+
+/// Distinct file count of a batch's entries — a file changed twice in the wave counts once.
+fn distinct_files(entries: &[BatchEntry]) -> usize {
+    entries
+        .iter()
+        .map(|e| e.rel_path.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+/// Header of the `lh batch <id>` entries table (plan M6 §3.5: rel_path, seq, kind, size).
+fn batch_entry_header() -> Vec<String> {
+    vec![
+        t!("batches.col_entry.file").to_string(),
+        t!("batches.col_entry.seq").to_string(),
+        t!("batches.col_entry.kind").to_string(),
+        t!("batches.col_entry.size").to_string(),
+    ]
+}
+
+/// Body rows of the `lh batch <id>` entries table. All in-batch versions are listed —
+/// a file changed twice in the same wave appears on two rows.
+fn batch_entry_rows(entries: &[BatchEntry]) -> Vec<Vec<String>> {
+    entries
+        .iter()
+        .map(|e| {
+            vec![
+                e.rel_path.clone(),
+                e.version.seq.to_string(),
+                e.version.kind.as_str().to_string(),
+                human_size(e.version.size),
+            ]
+        })
+        .collect()
+}
+
+/// `--json` shape of one batch entry (the table fields plus version id and times).
+fn batch_entry_json(e: &BatchEntry) -> serde_json::Value {
+    json!({
+        "rel_path": e.rel_path,
+        "id": e.version.id,
+        "seq": e.version.seq,
+        "time": format_time(e.version.timestamp_micros),
+        "timestamp_micros": e.version.timestamp_micros,
+        "kind": e.version.kind.as_str(),
+        "storage": e.version.storage.as_str(),
+        "size": e.version.size,
+    })
+}
+
+/// `--json` shape of a whole-batch revert (plan M6 §3.5: the engine's RevertReport with
+/// each `(rel_path, message)` error pair as an object).
+fn revert_report_json(r: &RevertReport) -> serde_json::Value {
+    let errors: Vec<_> = r
+        .errors
+        .iter()
+        .map(|(file, err)| json!({ "file": file, "error": err }))
+        .collect();
+    json!({
+        "reverted": r.reverted,
+        "restored": r.restored,
+        "deleted": r.deleted,
+        "skipped": r.skipped,
+        "errors": errors,
+    })
+}
+
+fn cmd_batches(cli: &Cli, limit: Option<u32>) -> Result<()> {
+    let limit = limit.unwrap_or(BATCHES_DEFAULT_LIMIT);
+    let root = store_root(cli)?;
+    let store = open_read(&root)?;
+    let batches = collect_batches(&store, limit)?;
+
+    if cli.json {
+        let arr: Vec<_> = batches.iter().map(batch_summary_json).collect();
+        println!("{}", json!({ "batches": arr }));
+        return Ok(());
+    }
+    if batches.is_empty() {
+        println!("{}", t!("batches.none", root = root.display()));
+        return Ok(());
+    }
+    let show_ws = store.workspaces()?.len() > 1;
+    print_table(&batches_header(show_ws), &batches_rows(&batches, show_ws));
+    Ok(())
+}
+
+fn cmd_batch(cli: &Cli, id: u32) -> Result<()> {
+    let root = store_root(cli)?;
+    let store = open_read(&root)?;
+    let entries = store.batch_entries(i64::from(id))?;
+
+    if cli.json {
+        let arr: Vec<_> = entries.iter().map(batch_entry_json).collect();
+        println!(
+            "{}",
+            json!({ "batch": id, "count": entries.len(), "entries": arr })
+        );
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!("{}", t!("batches.none_entries", id = id));
+        return Ok(());
+    }
+    println!(
+        "{}",
+        t!(
+            "batches.batch_header",
+            id = id,
+            files = distinct_files(&entries),
+            versions = entries.len()
+        )
+    );
+    print_table(&batch_entry_header(), &batch_entry_rows(&entries));
+    Ok(())
+}
+
+fn cmd_revert_batch(cli: &Cli, id: u32, yes: bool, force: bool) -> Result<()> {
+    let root = store_root(cli)?;
+    let store = LocalHistory::open(&root)?; // rw — revert_batch writes disk and index
+    // Fetch first: an unknown id fails here (exit 1) before any prompt or write.
+    let entries = store.batch_entries(i64::from(id))?;
+
+    if !yes {
+        println!(
+            "{}",
+            t!("batches.revert.plan", id = id, files = distinct_files(&entries))
+        );
+        print!("{}", t!("batches.revert.confirm", id = id));
+        std::io::stdout().flush()?;
+        let mut ans = String::new();
+        std::io::stdin().read_line(&mut ans)?;
+        let reply = ans.trim();
+        if !(reply.eq_ignore_ascii_case("y") || reply.eq_ignore_ascii_case("yes")) {
+            if cli.json {
+                println!("{}", json!({ "reverted": false, "reason": "cancelled" }));
+            } else {
+                println!("{}", t!("batches.revert.cancelled"));
+            }
+            return Ok(());
+        }
+    }
+
+    let report = store.revert_batch(i64::from(id), force)?;
+    if cli.json {
+        println!("{}", revert_report_json(&report));
+        return Ok(());
+    }
+    println!("{}", t!("batches.revert.done", id = id));
+    println!("{}", t!("batches.revert.count_reverted", n = report.reverted));
+    println!("{}", t!("batches.revert.count_restored", n = report.restored));
+    println!("{}", t!("batches.revert.count_deleted", n = report.deleted));
+    println!("{}", t!("batches.revert.count_skipped", n = report.skipped));
+    println!(
+        "{}",
+        t!("batches.revert.count_errors", n = report.errors.len())
+    );
+    for (file, err) in &report.errors {
+        println!("{}", t!("batches.revert.error_line", file = file, err = err));
+    }
     Ok(())
 }
 
@@ -1358,6 +1649,42 @@ mod tests {
         assert!(*check && *force && *restart);
     }
 
+    #[test]
+    fn parse_batches_batch_revert_batch() {
+        let cli = Cli::try_parse_from(["lh", "batches"]).unwrap();
+        let Some(Command::Batches { limit }) = &cli.command else {
+            panic!("expected Batches, got {:?}", cli.command)
+        };
+        assert_eq!(*limit, None); // default cap, resolved in cmd_batches
+
+        let cli = Cli::try_parse_from(["lh", "batches", "--limit", "5"]).unwrap();
+        let Some(Command::Batches { limit }) = &cli.command else {
+            panic!("expected Batches, got {:?}", cli.command)
+        };
+        assert_eq!(*limit, Some(5));
+
+        let cli = Cli::try_parse_from(["lh", "batch", "7"]).unwrap();
+        let Some(Command::Batch { id }) = &cli.command else {
+            panic!("expected Batch, got {:?}", cli.command)
+        };
+        assert_eq!(*id, 7);
+
+        // defaults: the confirmation prompt fires, files edited after the batch are kept
+        let cli = Cli::try_parse_from(["lh", "revert-batch", "3"]).unwrap();
+        let Some(Command::RevertBatch { id, yes, force }) = &cli.command else {
+            panic!("expected RevertBatch, got {:?}", cli.command)
+        };
+        assert_eq!(*id, 3);
+        assert!(!*yes && !*force);
+
+        let cli = Cli::try_parse_from(["lh", "revert-batch", "3", "--yes", "--force"]).unwrap();
+        let Some(Command::RevertBatch { id, yes, force }) = &cli.command else {
+            panic!("expected RevertBatch, got {:?}", cli.command)
+        };
+        assert_eq!(*id, 3);
+        assert!(*yes && *force);
+    }
+
     // ----- resolve workspace -----
 
     #[test]
@@ -1438,6 +1765,176 @@ mod tests {
         assert!(err.contains("seq 1..3"), "{err}");
     }
 
+    // ----- batches (plan M6 §3.5) -----
+
+    /// Minimal Version for the batch row/json helper tests (id == seq, epoch time, full).
+    fn mk_test_version(seq: i64) -> Version {
+        Version {
+            id: seq,
+            file_id: 1,
+            seq,
+            timestamp_micros: 1_700_000_000_000_000,
+            kind: EventKind::External,
+            label: None,
+            storage: history::Storage::Full,
+            base_seq: None,
+            size: 0,
+            content_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn format_range_same_day_cross_day_and_equal() {
+        // 2023-11-14 22:13:20 UTC (public reference value)
+        let start = 1_700_000_000_000_000i64;
+        assert_eq!(format_range(start, start), "2023-11-14 22:13:20");
+        assert_eq!(
+            format_range(start, start + 3_000_000),
+            "2023-11-14 22:13:20 → 22:13:23"
+        );
+        // +1 day → the end crossed midnight, so the full datetime is appended
+        assert_eq!(
+            format_range(start, start + 86_400_000_000),
+            "2023-11-14 22:13:20 → 2023-11-15 22:13:20"
+        );
+    }
+
+    #[test]
+    fn batches_table_and_entry_rows() {
+        let mut b = WsBatch {
+            ws: 1,
+            root: PathBuf::from(r"D:\ws\b"),
+            batch: BatchSummary {
+                id: 4,
+                ws_id: 1,
+                started_at: 1_700_000_000_000_000,
+                ended_at: 1_700_000_003_000_000,
+                kind: "auto".into(),
+                label: None,
+                version_count: 6,
+                file_count: 4,
+            },
+        };
+        // single workspace → 4 columns; no label → the kind is shown
+        let rows = batches_rows(&[b.clone()], false);
+        assert_eq!(
+            rows[0],
+            vec!["4", "2023-11-14 22:13:20 → 22:13:23", "4", "auto"]
+        );
+        // several workspaces → the ws column (root path) is inserted after id
+        let rows = batches_rows(&[b.clone()], true);
+        assert_eq!(rows[0].len(), 5);
+        assert_eq!(rows[0][1], r"D:\ws\b");
+        // a labeled batch shows the label, not the kind
+        b.batch.label = Some("deploy".into());
+        let rows = batches_rows(&[b], false);
+        assert_eq!(rows[0][3], "deploy");
+
+        // entries table rows: rel_path, seq, kind, size — every in-batch version listed
+        let entries = vec![
+            BatchEntry { rel_path: "a.txt".into(), version: mk_test_version(2) },
+            BatchEntry { rel_path: "b.txt".into(), version: mk_test_version(1) },
+            BatchEntry { rel_path: "a.txt".into(), version: mk_test_version(3) },
+        ];
+        assert_eq!(distinct_files(&entries), 2, "a.txt counted once");
+        let rows = batch_entry_rows(&entries);
+        assert_eq!(rows[0], vec!["a.txt", "2", "external", "0 B"]);
+        assert_eq!(rows[2][1], "3");
+    }
+
+    #[test]
+    fn batch_json_shapes() {
+        // element of the `{ "batches": [...] }` array (plan M6 §3.5)
+        let w = WsBatch {
+            ws: 1,
+            root: PathBuf::from("D:/ws"),
+            batch: BatchSummary {
+                id: 4,
+                ws_id: 1,
+                started_at: 1_700_000_000_000_000,
+                ended_at: 1_700_000_003_000_000,
+                kind: "auto".into(),
+                label: None,
+                version_count: 6,
+                file_count: 4,
+            },
+        };
+        let j = batch_summary_json(&w);
+        assert_eq!(j["id"], 4);
+        assert_eq!(j["ws"], "D:/ws");
+        assert_eq!(j["files"], 4);
+        assert_eq!(j["versions"], 6);
+        assert_eq!(j["kind"], "auto");
+        assert!(j["label"].is_null());
+        assert_eq!(j["started"], "2023-11-14 22:13:20");
+        assert_eq!(j["ended"], "2023-11-14 22:13:23");
+        assert_eq!(j["started_at"], 1_700_000_000_000_000i64);
+
+        // element of the `lh batch <id>` entries array
+        let e = BatchEntry { rel_path: "src/main.rs".into(), version: mk_test_version(9) };
+        let j = batch_entry_json(&e);
+        assert_eq!(j["rel_path"], "src/main.rs");
+        assert_eq!(j["id"], 9);
+        assert_eq!(j["seq"], 9);
+        assert_eq!(j["kind"], "external");
+        assert_eq!(j["storage"], "full");
+        assert_eq!(j["size"], 0);
+        assert_eq!(j["time"], "2023-11-14 22:13:20");
+
+        // RevertReport → counters + error objects (file/error keys)
+        let r = RevertReport {
+            reverted: 2,
+            restored: 1,
+            deleted: 0,
+            skipped: 3,
+            errors: vec![("a.txt".into(), "io error".into())],
+        };
+        let j = revert_report_json(&r);
+        assert_eq!(j["reverted"], 2);
+        assert_eq!(j["restored"], 1);
+        assert_eq!(j["deleted"], 0);
+        assert_eq!(j["skipped"], 3);
+        assert_eq!(j["errors"][0]["file"], "a.txt");
+        assert_eq!(j["errors"][0]["error"], "io error");
+    }
+
+    #[test]
+    fn collect_batches_merges_workspaces_newest_first() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = LocalHistory::open(store_dir.path()).unwrap();
+        // no workspace registered → empty (the caller prints the empty state)
+        assert!(collect_batches(&store, 50).unwrap().is_empty());
+
+        let ws_a = tempfile::tempdir().unwrap();
+        let ws_b = tempfile::tempdir().unwrap();
+        let id_a = store.register_workspace(ws_a.path()).unwrap();
+        let id_b = store.register_workspace(ws_b.path()).unwrap();
+
+        let f_a = ws_a.path().join("a.txt");
+        std::fs::write(&f_a, b"v1").unwrap();
+        store
+            .record(id_a, &f_a, b"v1", EventKind::External, None)
+            .unwrap();
+        // a later record in the OTHER workspace → its own batch, newer started_at
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let f_b = ws_b.path().join("b.txt");
+        std::fs::write(&f_b, b"v1").unwrap();
+        store
+            .record(id_b, &f_b, b"v1", EventKind::External, None)
+            .unwrap();
+
+        let rows = collect_batches(&store, 50).unwrap();
+        assert_eq!(rows.len(), 2);
+        // merged newest-first across workspaces, tagged with the matching roots
+        assert_eq!(rows[0].ws, id_b);
+        assert_eq!(rows[1].ws, id_a);
+        assert!(rows[0].batch.started_at >= rows[1].batch.started_at);
+        assert_eq!(rows[0].root, store.workspace_root(id_b).unwrap());
+        assert_eq!(rows[1].root, store.workspace_root(id_a).unwrap());
+        // `--limit` applies per workspace — both batches survive a limit of 1
+        assert_eq!(collect_batches(&store, 1).unwrap().len(), 2);
+    }
+
     // ----- i18n -----
 
     /// set_locale is process-global state — this lock keeps locale-switching tests from
@@ -1470,6 +1967,27 @@ mod tests {
         // the confirm prompt keeps its trailing space — the user types right after "[y/N] "
         assert!(t!("revert.confirm", locale = "vi", seq = 3).ends_with("[y/N] "));
         assert!(t!("revert.confirm", locale = "en", seq = 3).ends_with("[y/N] "));
+    }
+
+    #[test]
+    fn i18n_batches_keys_en_vi() {
+        // the batches.* group (plan M6 §3.5); key-set parity en/vi is enforced globally
+        // by i18n_yml_key_parity_and_cover_t_calls
+        assert_eq!(
+            t!("batches.revert.confirm", locale = "en", id = 5),
+            "Revert batch 5? [y/N] "
+        );
+        assert!(t!("batches.revert.confirm", locale = "vi", id = 5).ends_with("[y/N] "));
+        assert_eq!(
+            t!("batches.batch_header", locale = "vi", id = 5, files = 3, versions = 4),
+            "batch 5 — 3 file, 4 version:"
+        );
+        assert_eq!(
+            t!("batches.batch_header", locale = "en", id = 5, files = 3, versions = 4),
+            "batch 5 — 3 files, 4 versions:"
+        );
+        assert!(t!("batches.none", locale = "en", root = "S").contains("no batches yet"));
+        assert!(t!("batches.none", locale = "vi", root = "S").contains("chưa có batch nào"));
     }
 
     #[test]

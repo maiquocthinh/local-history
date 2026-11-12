@@ -12,6 +12,11 @@ use rust_i18n::t;
 use serde::{Deserialize, Serialize};
 use time::{Date, Duration, OffsetDateTime, UtcOffset};
 
+/// Serializes tests that depend on the process-global i18n locale (rust-i18n's
+/// `set_locale` is global state). Tests in every gui module lock this guard.
+#[cfg(test)]
+pub(crate) static LOCALE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ---------------------------------------------------------------------------
 // Persisted state + language
 // ---------------------------------------------------------------------------
@@ -406,10 +411,6 @@ mod tests {
     }
 
     // ----- format_relative_time -----
-
-    /// `set_locale` is process-global — serializes tests that depend on
-    /// locale-sensitive strings.
-    static LOCALE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn relative_time_buckets() {
