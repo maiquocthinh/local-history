@@ -177,6 +177,84 @@ impl DiffModel {
 }
 
 // ---------------------------------------------------------------------------
+// Shared drawing helpers — the single-file diff (`show_diff`) and the batch
+// view blocks (app.rs) both render side-by-side through these, so the grid
+// looks and measures identically everywhere.
+// ---------------------------------------------------------------------------
+
+/// Measured grid geometry of the side-by-side diff, shared by `show_diff` and
+/// the batch view blocks.
+#[derive(Debug, Clone, Copy)]
+pub struct DiffLayout {
+    /// Row height (font row height + padding).
+    pub row_h: f32,
+    /// Width of one monospace char (drives the caret→column mapping).
+    pub char_w: f32,
+    /// Width of one cell (gutter + text), at least half the available width.
+    pub cell_w: f32,
+}
+
+/// Measures the side-by-side grid for `max_chars` (the longest line on either
+/// side): the cell is at least half the available width, stretched by the
+/// longest line.
+pub fn measure_layout(ui: &mut egui::Ui, max_chars: usize) -> DiffLayout {
+    let font = diff_font();
+    let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 4.0;
+    let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0')).max(0.5);
+    let avail = ui.available_width() - 20.0;
+    let min_cell = (avail / 2.0).max(120.0);
+    let content_w = GUTTER + 8.0 + max_chars as f32 * char_w;
+    DiffLayout { row_h, char_w, cell_w: min_cell.max(content_w) }
+}
+
+/// Status text shown above the panes: an explicit note, or the "identical"
+/// message when there are zero hunks. Shared by `show_diff` and the batch view.
+pub fn note_text(model: &DiffModel) -> Option<String> {
+    model
+        .note
+        .clone()
+        .or_else(|| model.identical.then(|| t!("diff.identical").to_string()))
+}
+
+/// Draws the two pane headings (half width each, truncated) + the separator
+/// under them.
+pub fn draw_pane_headings(ui: &mut egui::Ui, left_title: &str, right_title: &str) {
+    ui.horizontal(|ui| {
+        let w = (ui.available_width() - 20.0) / 2.0;
+        ui.add_sized(
+            [w, 18.0],
+            egui::Label::new(egui::RichText::new(left_title).monospace().weak())
+                .wrap_mode(egui::TextWrapMode::Truncate),
+        );
+        ui.add_sized(
+            [w, 18.0],
+            egui::Label::new(egui::RichText::new(right_title).monospace().weak())
+                .wrap_mode(egui::TextWrapMode::Truncate),
+        );
+    });
+    ui.separator();
+}
+
+/// Draws one row of the side-by-side grid: the left (old) and the right (new)
+/// cell, LEFT TO RIGHT — MUST be called inside a `ui.horizontal` (two
+/// sequential allocations in a vertical layout would stack them). `fill_*` is
+/// the selected char range of each cell (single-file diff only; the batch view
+/// passes `None`/`None` — no char-level selection there yet). Returns both cell
+/// responses for the drag/click handling in `show_diff`.
+pub fn draw_row_pair(
+    ui: &mut egui::Ui,
+    layout: &DiffLayout,
+    left: Option<&Line>,
+    right: Option<&Line>,
+    fill_left: Option<(usize, usize)>,
+    fill_right: Option<(usize, usize)>,
+) -> (egui::Response, egui::Response) {
+    let rl = draw_cell(ui, layout.cell_w, layout.row_h, layout.char_w, left, fill_left);
+    let rr = draw_cell(ui, layout.cell_w, layout.row_h, layout.char_w, right, fill_right);
+    (rl, rr)
+}
+
+// ---------------------------------------------------------------------------
 // Character-level selection (drag / shift+click, editor style) + raw-text copy
 // ---------------------------------------------------------------------------
 
@@ -388,11 +466,7 @@ fn cell_caret(c: &CellGeom<'_>, pointer_x: f32, char_w: f32) -> CaretPos {
 /// cells was just copied to the clipboard (the caller shows the toast).
 pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) -> Option<usize> {
     let total = model.left.len().max(model.right.len());
-    let note = model
-        .note
-        .clone()
-        .or_else(|| model.identical.then(|| t!("diff.identical").to_string()));
-    if let Some(note) = note {
+    if let Some(note) = note_text(model) {
         ui.vertical_centered(|ui| {
             ui.add_space(6.0);
             ui.label(egui::RichText::new(note).weak());
@@ -402,30 +476,11 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) 
         return None;
     }
 
-    // Cell width: at least half the available width, stretched by the longest line.
-    let font = diff_font();
-    let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 4.0;
-    let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0')).max(0.5);
-    let avail = ui.available_width() - 20.0;
-    let min_cell = (avail / 2.0).max(120.0);
-    let content_w = GUTTER + 8.0 + model.max_chars as f32 * char_w;
-    let cell_w = min_cell.max(content_w);
+    // Grid geometry: shared with the batch view blocks (same cell sizing math).
+    let layout = measure_layout(ui, model.max_chars);
 
     // Two column headings (same width split as the minimum content layout).
-    ui.horizontal(|ui| {
-        let w = (ui.available_width() - 20.0) / 2.0;
-        ui.add_sized(
-            [w, 18.0],
-            egui::Label::new(egui::RichText::new(&model.left_title).monospace().weak())
-                .wrap_mode(egui::TextWrapMode::Truncate),
-        );
-        ui.add_sized(
-            [w, 18.0],
-            egui::Label::new(egui::RichText::new(&model.right_title).monospace().weak())
-                .wrap_mode(egui::TextWrapMode::Truncate),
-        );
-    });
-    ui.separator();
+    draw_pane_headings(ui, &model.left_title, &model.right_title);
 
     // Events collected while drawing, processed after the row loop (the paint
     // of this frame already used the previous selection state; the update is
@@ -441,7 +496,7 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) 
     egui::ScrollArea::both()
         .id_salt("diff_scroll")
         .auto_shrink([false, false])
-        .show_rows(ui, row_h, total, |ui, rows| {
+        .show_rows(ui, layout.row_h, total, |ui, rows| {
             for r in rows {
                 let l = model.left.get(r);
                 let rt = model.right.get(r);
@@ -453,8 +508,7 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) 
                     cell_selected_cols(f, t, r, Pane::Right, rt.map(line_chars).unwrap_or(0))
                 });
                 ui.horizontal(|ui| {
-                    let rl = draw_cell(ui, cell_w, row_h, char_w, l, fill_l);
-                    let rr = draw_cell(ui, cell_w, row_h, char_w, rt, fill_r);
+                    let (rl, rr) = draw_row_pair(ui, &layout, l, rt, fill_l, fill_r);
                     cells.push(CellGeom { row: r, pane: Pane::Left, rect: rl.rect, line: l });
                     cells.push(CellGeom { row: r, pane: Pane::Right, rect: rr.rect, line: rt });
                     if rl.drag_started() {
@@ -483,7 +537,7 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) 
 
             // drag start: anchor and cursor both go to the press position
             if let Some(pos) = drag_start_pos
-                && let Some(c) = caret_at_screen_pos(pos, &cells, char_w)
+                && let Some(c) = caret_at_screen_pos(pos, &cells, layout.char_w)
             {
                 sel.anchor = Some(c);
                 sel.cursor = Some(c);
@@ -498,7 +552,7 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) 
             }
             // dragging: the cursor follows the pointer
             if let Some(pos) = drag_pos
-                && let Some(c) = caret_at_screen_pos(pos, &cells, char_w)
+                && let Some(c) = caret_at_screen_pos(pos, &cells, layout.char_w)
             {
                 sel.cursor = Some(c);
                 ui.ctx().request_repaint();
@@ -507,7 +561,7 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) 
             // shift+click: move only the cursor, keeping the anchor (editor
             // style — no anchor behaves like a plain click)
             if let Some(pos) = click_pos
-                && let Some(c) = caret_at_screen_pos(pos, &cells, char_w)
+                && let Some(c) = caret_at_screen_pos(pos, &cells, layout.char_w)
             {
                 ui.memory_mut(|mem| {
                     if let Some(f) = mem.focused() {

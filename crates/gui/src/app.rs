@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use history::{
-    BatchEntry, BatchId, BatchSummary, EventKind, FileSummary, LocalHistory, RevertReport, Version,
-    VersionId, WorkspaceId,
+    BatchEntry, BatchId, BatchSummary, EventKind, FileSummary, Hunk, LocalHistory, RevertReport,
+    Version, VersionId, WorkspaceId,
 };
 use rust_i18n::t;
 use time::{Date, OffsetDateTime, UtcOffset};
@@ -163,6 +163,42 @@ pub struct CachedDiff {
     pub disk_bytes: Option<Vec<u8>>,
 }
 
+/// One file block of the batch view: header info + the renderable side-by-side
+/// model (left = before the batch, right = the batched version).
+#[derive(Debug, Clone)]
+pub struct BatchBlock {
+    /// Workspace-relative path of the file (shown in the block header).
+    pub rel_path: String,
+    /// Kind of the batched version (shown in the block header).
+    pub kind: EventKind,
+    /// Size of the batched content, in bytes (shown in the block header).
+    pub size: u64,
+    /// Side-by-side model; `left_title`/`right_title` carry the i18n pane
+    /// titles ("Before batch" / "In batch (seq N)").
+    pub model: DiffModel,
+}
+
+/// Cached batch view (one block per batch entry, engine order = rel_path,
+/// seq); rebuilt whenever the selected batch, the data token, or the entry
+/// list changes — the same pattern as [`CachedDiff`], whose key includes the
+/// token.
+#[derive(Debug)]
+pub struct CachedBatchView {
+    /// Batch the blocks were built for.
+    pub batch_id: BatchId,
+    /// Data token (`last_token`) the blocks were built against; a change means
+    /// the store data moved (e.g. a whole-batch revert) and a rebuild is due.
+    pub token: u64,
+    /// Fingerprint of the `batch_entries` list the blocks were built from
+    /// ([`batch_entries_fingerprint`]). Separates the just-cleared list (a
+    /// batch click clears the entries; the refill lands on the next poll)
+    /// from the loaded one — the token alone cannot (a click changes no
+    /// store data), so without it an empty view would stay cached forever.
+    pub entries_fp: u64,
+    /// One block per batch entry, in `batch_entries` order.
+    pub blocks: Vec<BatchBlock>,
+}
+
 /// Application state: polled engine data, current selection, cached diff, and
 /// pending modal actions.
 pub struct App {
@@ -187,6 +223,16 @@ pub struct App {
     pub selected_batch: Option<BatchId>,
     /// Versions of the selected batch, reloaded on each poll.
     pub batch_entries: Vec<BatchEntry>,
+    /// Entry clicked in the activity tab: its index in `batch_entries` (which
+    /// maps 1:1 onto the batch view blocks — one block per entry, same order)
+    /// plus the clicked rel_path. The index picks the right block when a file
+    /// changed twice in one batch (two entries/blocks share one rel_path);
+    /// the path re-check drops a stale index (entries reloaded in between).
+    /// One-shot: the center view scrolls the block into view once, then clears.
+    pub batch_focus_entry: Option<(usize, String)>,
+    /// Cached batch view blocks; rebuilt when the selected batch or the data
+    /// token changes (see [`CachedBatchView`]).
+    pub batch_diff_cache: Option<CachedBatchView>,
     /// `version_id -> batch_id` of the selected file — the timeline ⊕ badge
     /// (`batch_map_for_file`; `struct Version` stays untouched).
     pub batch_versions: HashMap<VersionId, BatchId>,
@@ -262,6 +308,8 @@ impl App {
             batches: Vec::new(),
             selected_batch: None,
             batch_entries: Vec::new(),
+            batch_focus_entry: None,
+            batch_diff_cache: None,
             batch_versions: HashMap::new(),
             kind_filter: None,
             label_filter: String::new(),
@@ -432,9 +480,12 @@ impl App {
             match entries {
                 Ok(list) => self.batch_entries = list,
                 Err(history::Error::NotFound(_)) => {
-                    // the batch vanished (GC'd / store switched) — drop the selection
+                    // the batch vanished (GC'd / store switched) — drop the
+                    // selection and everything built on top of it
                     self.selected_batch = None;
                     self.batch_entries.clear();
+                    self.batch_diff_cache = None;
+                    self.batch_focus_entry = None;
                 }
                 Err(e) => self.set_status(t!("batch.err_list", e = e).to_string(), false),
             }
@@ -521,6 +572,8 @@ impl App {
         self.batches.clear();
         self.selected_batch = None;
         self.batch_entries.clear();
+        self.batch_diff_cache = None;
+        self.batch_focus_entry = None;
         self.batch_versions.clear();
         self.diff_cache = None;
         self.last_token = 0;
@@ -547,6 +600,8 @@ impl App {
         self.batches.clear();
         self.selected_batch = None;
         self.batch_entries.clear();
+        self.batch_diff_cache = None;
+        self.batch_focus_entry = None;
         self.batch_versions.clear();
         self.diff_cache = None;
         self.last_token = 0;
@@ -911,9 +966,14 @@ impl App {
     fn activity_tab(&mut self, ui: &mut egui::Ui) {
         let now = (state::local_now().unix_timestamp_nanos() / 1000) as i64;
         let offset = state::local_utc_offset();
+        // The list must NOT take the whole panel height — the selected batch's
+        // entries + revert button live below it (a full-height ScrollArea would
+        // squeeze them to zero pixels, which is exactly the bug seen live).
+        let list_max = (ui.available_height() * 0.45).max(120.0);
         egui::ScrollArea::vertical()
             .id_salt("batch_list")
-            .auto_shrink([false, false])
+            .auto_shrink([false, true])
+            .max_height(list_max)
             .show(ui, |ui| {
                 if self.batches.is_empty() {
                     ui.weak(t!("batch.empty"));
@@ -924,6 +984,8 @@ impl App {
                     if self.batch_row(ui, &b, selected, now, offset).clicked() {
                         self.selected_batch = Some(b.id);
                         self.batch_entries.clear();
+                        // the focus belonged to the previous batch's view
+                        self.batch_focus_entry = None;
                         self.next_poll = None; // load the entries on the next frame
                     }
                 }
@@ -958,20 +1020,59 @@ impl App {
                 .id_salt("batch_entries")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for e in &self.batch_entries {
-                        let (rel, meta) = batch_entry_row(e);
-                        ui.horizontal(|ui| {
-                            ui.label(rel);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.small(meta);
-                            });
-                        });
+                    for i in 0..self.batch_entries.len() {
+                        let e = self.batch_entries[i].clone();
+                        // focused = this entry's block is (about to be) scrolled
+                        // to in the center batch view — compared by INDEX plus
+                        // rel_path (the same condition `batch_focus_block`
+                        // applies) so only the clicked row lights up when a file
+                        // has two entries, and a stale flag never highlights
+                        let focused = self
+                            .batch_focus_entry
+                            .as_ref()
+                            .is_some_and(|(fi, rel)| *fi == i && *rel == e.rel_path);
+                        if self.batch_entry_row(ui, &e, focused).clicked() {
+                            self.batch_focus_entry = Some((i, e.rel_path.clone()));
+                        }
                     }
                     if self.batch_entries.is_empty() {
                         ui.weak(t!("batch.no_entries"));
                     }
                 });
         }
+    }
+
+    /// One clickable batch-entry row: rel path + kind · size. Clicking focuses
+    /// the entry: the center batch view scrolls to that entry's block (see
+    /// `batch_view_panel`). Same look as `batch_row` — highlight on focus/hover.
+    fn batch_entry_row(&self, ui: &mut egui::Ui, e: &BatchEntry, focused: bool) -> egui::Response {
+        let h = 22.0;
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click());
+        if focused {
+            ui.painter()
+                .rect_filled(rect, 4.0, ui.visuals().selection.bg_fill.gamma_multiply(0.6));
+        } else if resp.hovered() {
+            ui.painter()
+                .rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
+        }
+        let p = ui.painter_at(rect);
+        let (rel, meta) = batch_entry_row(e);
+        p.text(
+            egui::pos2(rect.left() + 6.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            rel,
+            egui::FontId::proportional(12.5),
+            egui::Color32::from_rgb(225, 225, 225),
+        );
+        p.text(
+            egui::pos2(rect.right() - 6.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            meta,
+            egui::FontId::proportional(11.0),
+            egui::Color32::from_rgb(150, 150, 150),
+        );
+        resp
     }
 
     /// One batch row: relative start time · file count · label-or-kind.
@@ -1235,6 +1336,13 @@ impl App {
     }
 
     fn diff_panel(&mut self, ui: &mut egui::Ui) {
+        // While the Activity tab has a batch selected, the center shows the
+        // WHOLE batch (PR-page style) instead of the single-file diff; the
+        // Files tab (or a cleared batch) brings the old panel back unchanged.
+        if self.left_tab == LeftTab::Activity && self.selected_batch.is_some() {
+            self.batch_view_panel(ui);
+            return;
+        }
         ui.horizontal(|ui| {
             ui.label(t!("diff.compare"));
             egui::ComboBox::from_id_salt("diff_mode")
@@ -1305,6 +1413,181 @@ impl App {
         if let Some(n) = copied {
             self.set_status(t!("diff.copied", n = n).to_string(), true);
         }
+    }
+
+    /// Center panel in batch mode: every file of the selected batch as one
+    /// side-by-side block (before→in-batch), stacked continuously like a PR
+    /// page. The cache rebuilds when the selected batch, the data token, or
+    /// the entry list changes (`CachedBatchView`); clicking an entry in the
+    /// activity tab scrolls its block into view (`batch_focus_entry` →
+    /// `Response::scroll_to_me`).
+    fn batch_view_panel(&mut self, ui: &mut egui::Ui) {
+        // Panel title, drawn BEFORE the ScrollArea — a full-height scroll would
+        // squeeze anything drawn after it to zero pixels (activity_tab lesson).
+        if let Some(id) = self.selected_batch {
+            let count = self
+                .batches
+                .iter()
+                .find(|b| b.id == id)
+                .map(|b| b.file_count)
+                .unwrap_or(0);
+            ui.strong(t!("batch.entries_title", id = id, count = file_count_text(count)));
+            ui.separator();
+        }
+
+        // cache: rebuild when the selected batch, the data token, or the entry
+        // list changed (a revert bumps the token, so force-refresh flows end up
+        // here too; a batch click clears the entries and the refill lands on
+        // the next poll, which changes the fingerprint — the click frame builds
+        // from the just-cleared list, so the fingerprint must gate the cache or
+        // that empty build would stick forever)
+        let wanted = self.selected_batch.map(|id| {
+            (id, self.last_token, batch_entries_fingerprint(&self.batch_entries))
+        });
+        let stale = match (&self.batch_diff_cache, wanted) {
+            (Some(c), Some((id, tok, fp))) => {
+                c.batch_id != id || c.token != tok || c.entries_fp != fp
+            }
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => false,
+        };
+        if stale {
+            self.batch_diff_cache = wanted.map(|(id, tok, fp)| self.build_batch_view(id, tok, fp));
+        }
+        let Some(cache) = &self.batch_diff_cache else { return };
+
+        // resolve the focus BEFORE drawing (the entry click may target a block
+        // drawn later — `scroll_to_me` registers the target for this frame and
+        // the ScrollArea consumes it after the whole pass)
+        let focus_block = batch_focus_block(
+            &cache.blocks,
+            self.batch_focus_entry.as_ref().map(|(i, rel)| (*i, rel.as_str())),
+        );
+
+        egui::ScrollArea::vertical()
+            .id_salt("batch_view")
+            // hug short content, scroll only when it overflows — never reserve
+            // the full panel height (activity_tab layout lesson)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (i, block) in cache.blocks.iter().enumerate() {
+                    Self::draw_batch_block(ui, block, Some(i) == focus_block);
+                    ui.add_space(10.0);
+                }
+                if cache.blocks.is_empty() {
+                    ui.weak(t!("batch.no_entries"));
+                }
+            });
+        // the scroll target is registered (egui takes it after the content
+        // pass) — the one-shot flag can go now
+        if focus_block.is_some() {
+            self.batch_focus_entry = None;
+        }
+    }
+
+    /// One batch view block: header (rel path + kind · size, highlighted while
+    /// focused) + pane titles + side-by-side rows reusing `diff_view`'s grid
+    /// drawing. Returns the header response so the caller can scroll to it.
+    fn draw_batch_block(ui: &mut egui::Ui, block: &BatchBlock, focused: bool) -> egui::Response {
+        let header = batch_block_header(ui, block, focused);
+        if focused {
+            header.scroll_to_me(Some(egui::Align::Min));
+        }
+        diff_view::draw_pane_headings(ui, &block.model.left_title, &block.model.right_title);
+        if let Some(note) = diff_view::note_text(&block.model) {
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new(note).weak());
+            });
+        }
+        if block.model.binary {
+            return header;
+        }
+        let total = block.model.left.len().max(block.model.right.len());
+        if total == 0 {
+            return header;
+        }
+        let layout = diff_view::measure_layout(ui, block.model.max_chars);
+        for r in 0..total {
+            ui.horizontal(|ui| {
+                diff_view::draw_row_pair(
+                    ui,
+                    &layout,
+                    block.model.left.get(r),
+                    block.model.right.get(r),
+                    None,
+                    None,
+                );
+            });
+        }
+        // ponytail: char-level drag-select/copy inside the batch view — a later
+        // phase; the single-file diff (show_diff) keeps the full editor-style
+        // selection today.
+        header
+    }
+
+    /// Builds the batch view blocks for one batch: one block per entry (engine
+    /// order = rel_path, seq). Left = the newest version with a smaller seq
+    /// (none ⇒ the file was created in this batch ⇒ empty left side); right =
+    /// the batched version. Content loads only here, one batch at a time;
+    /// every store failure becomes a note block — never a panic.
+    fn build_batch_view(&self, batch_id: BatchId, token: u64, entries_fp: u64) -> CachedBatchView {
+        let mut blocks = Vec::new();
+        let (Some(ws), Some(store)) = (self.current_ws, self.ro.as_ref()) else {
+            return CachedBatchView { batch_id, token, entries_fp, blocks };
+        };
+        for e in &self.batch_entries {
+            let file = self.ws_file_path(ws, &e.rel_path);
+            let hist = match store.history(ws, &file) {
+                Ok(h) => h,
+                Err(err) => {
+                    blocks.push(batch_note_block(e, t!("err.history", e = err).to_string()));
+                    continue;
+                }
+            };
+            let pre_id = pick_pre_version(&hist, e.version.seq);
+            let hunks = match pre_id {
+                Some(pid) => match store.diff_lines(pid, e.version.id) {
+                    Ok(h) => Some(h),
+                    // one side is binary — the engine refused to diff; the
+                    // builder renders the binary note instead
+                    Err(history::Error::BinaryContent(_)) => None,
+                    Err(err) => {
+                        blocks.push(batch_note_block(e, t!("err.diff", e = err).to_string()));
+                        continue;
+                    }
+                },
+                None => Some(Vec::new()), // created in this batch — no hunks needed
+            };
+            let pre_bytes = match pre_id {
+                Some(pid) => match store.content(pid) {
+                    Ok(b) => b,
+                    Err(err) => {
+                        blocks.push(batch_note_block(e, t!("err.content", e = err).to_string()));
+                        continue;
+                    }
+                },
+                None => Vec::new(), // no pre-batch version ⇒ empty left side
+            };
+            let batch_bytes = match e.version.kind {
+                // deleted in this batch: the engine stores an empty marker
+                // anyway; force empty so the right side can never show stale bytes
+                EventKind::Delete => Vec::new(),
+                _ => match store.content(e.version.id) {
+                    Ok(b) => b,
+                    Err(err) => {
+                        blocks.push(batch_note_block(e, t!("err.content", e = err).to_string()));
+                        continue;
+                    }
+                },
+            };
+            blocks.push(BatchBlock {
+                rel_path: e.rel_path.clone(),
+                kind: e.version.kind,
+                size: e.version.size,
+                model: build_batch_block(&e.version, &pre_bytes, &batch_bytes, hunks.as_deref()),
+            });
+        }
+        CachedBatchView { batch_id, token, entries_fp, blocks }
     }
 
     /// Copies the unified diff of the current pair straight from the ENGINE
@@ -1659,6 +1942,124 @@ fn batch_entry_row(e: &BatchEntry) -> (String, String) {
     )
 }
 
+/// The version the file had just BEFORE the batch: the newest entry of the
+/// file's history with a seq SMALLER than the batched version's seq (seq is
+/// per-file, so this is the previous chain entry regardless of batches).
+/// `None` = no smaller seq ⇒ the file was created in this batch (empty left
+/// side). Takes the MAXIMUM smaller seq, so it is correct for any input order
+/// (the engine returns newest-first).
+pub fn pick_pre_version(history: &[Version], seq: i64) -> Option<VersionId> {
+    history.iter().filter(|v| v.seq < seq).max_by_key(|v| v.seq).map(|v| v.id)
+}
+
+/// A block that only reports a store read failure: the header stays (rel path,
+/// kind, size), the panes carry the message instead of content.
+fn batch_note_block(e: &BatchEntry, note: String) -> BatchBlock {
+    BatchBlock {
+        rel_path: e.rel_path.clone(),
+        kind: e.version.kind,
+        size: e.version.size,
+        model: DiffModel::empty_note(note),
+    }
+}
+
+/// Builds one batch block's side-by-side model from raw sides. `hunks == None`
+/// means the engine refused to diff (`BinaryContent`) — the block shows the
+/// binary note. Either side being invalid UTF-8 renders the same note. A
+/// Delete version forces an EMPTY right side (the engine stores Delete as an
+/// empty marker; forced here so stale bytes can never leak into the pane).
+/// Zero hunks ⇒ the "identical" note (rendered via [`diff_view::note_text`]).
+pub fn build_batch_block(
+    v: &Version,
+    pre_bytes: &[u8],
+    batch_bytes: &[u8],
+    hunks: Option<&[Hunk]>,
+) -> DiffModel {
+    let left_title = t!("batch.view_left_title").to_string();
+    let right_title = t!("batch.view_right_title", seq = v.seq).to_string();
+    let binary = |binary: bool| DiffModel {
+        left_title: left_title.clone(),
+        right_title: right_title.clone(),
+        left: Vec::new(),
+        right: Vec::new(),
+        binary,
+        note: Some(t!("diff.binary").to_string()),
+        identical: false,
+        max_chars: 0,
+    };
+    let Some(hunks) = hunks else { return binary(true) };
+    let Ok(pre_text) = std::str::from_utf8(pre_bytes) else { return binary(true) };
+    let batch_bytes: &[u8] = if v.kind == EventKind::Delete { &[] } else { batch_bytes };
+    let Ok(batch_text) = std::str::from_utf8(batch_bytes) else { return binary(true) };
+    let base = state::split_lines(pre_text);
+    let target = state::split_lines(batch_text);
+    let (left, right) = diff_view::apply_hunks_to_sides(&base, &target, hunks);
+    DiffModel {
+        left_title,
+        right_title,
+        left,
+        right,
+        binary: false,
+        note: None,
+        identical: hunks.is_empty(),
+        max_chars: 0,
+    }
+    .finished()
+}
+
+/// Index of the block a focus target maps to. The focus carries the clicked
+/// entry's INDEX (blocks map 1:1 onto `batch_entries`, same order), so a file
+/// changed twice in one batch — two entries, two blocks, one rel_path — still
+/// scrolls to the block the user clicked, not the first with that path. The
+/// rel_path rides along as a stale-index guard: entries reloaded between the
+/// click and the draw (GC, batch switch) must not scroll to a mismatched
+/// block, so a path mismatch ⇒ `None`. `None` focus ⇒ `None`.
+pub fn batch_focus_block(blocks: &[BatchBlock], focus: Option<(usize, &str)>) -> Option<usize> {
+    let (idx, rel) = focus?;
+    blocks.get(idx).is_some_and(|b| b.rel_path == rel).then_some(idx)
+}
+
+/// Cheap fingerprint of the `batch_entries` list the batch view builds from:
+/// entry count + sum of the version ids (u64-wrapping). Stable across polls
+/// (the query orders by rel_path, seq and history is immutable), so it only
+/// changes when the list actually changes — which is what the cache key needs.
+pub fn batch_entries_fingerprint(entries: &[BatchEntry]) -> u64 {
+    let mut fp = entries.len() as u64;
+    for e in entries {
+        fp = fp.wrapping_add(e.version.id as u64);
+    }
+    fp
+}
+
+/// One batch-view block header: rel path (left) + kind · size (right), tinted
+/// while this block is the focus target. The response is returned so the
+/// caller can scroll it into view (`Response::scroll_to_me`).
+fn batch_block_header(ui: &mut egui::Ui, block: &BatchBlock, focused: bool) -> egui::Response {
+    let h = 26.0;
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+    if focused {
+        ui.painter()
+            .rect_filled(rect, 4.0, ui.visuals().selection.bg_fill.gamma_multiply(0.35));
+    }
+    let p = ui.painter_at(rect);
+    p.text(
+        egui::pos2(rect.left() + 4.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        block.rel_path.as_str(),
+        egui::FontId::proportional(14.0),
+        egui::Color32::from_rgb(240, 240, 240),
+    );
+    p.text(
+        egui::pos2(rect.right() - 6.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        format!("{} · {}", block.kind.as_str(), state::human_size(block.size)),
+        egui::FontId::proportional(11.0),
+        egui::Color32::from_rgb(150, 150, 150),
+    );
+    resp
+}
+
 /// Toast text for a whole-batch revert: the [`RevertReport`] counters plus the
 /// per-file error count (`batch.report*`).
 fn format_revert_report(r: &RevertReport) -> String {
@@ -1884,5 +2285,181 @@ mod tests {
         };
         assert!(format_revert_report(&r).ends_with("2 file(s) failed"));
         rust_i18n::set_locale("en"); // restore the default for other tests
+    }
+
+    // ----- batch view (pure part: pre-batch pick, block building, focus map) -----
+
+    fn hunk(old_start: u64, old_lines: u64, new_start: u64, new_lines: u64, new_text: &str) -> Hunk {
+        Hunk {
+            old_start,
+            old_lines,
+            new_start,
+            new_lines,
+            new_text: new_text.to_string(),
+        }
+    }
+
+    fn texts(model: &DiffModel, side: fn(&DiffModel) -> &Vec<Line>) -> Vec<String> {
+        side(model).iter().map(|l| l.text.clone()).collect()
+    }
+
+    #[test]
+    fn pick_pre_version_picks_largest_smaller_seq() {
+        // engine order: newest first
+        let hist = vec![ver(30, 5), ver(20, 3), ver(10, 1)];
+        // the newest seq below the batched one — even with gaps in the chain
+        assert_eq!(pick_pre_version(&hist, 6), Some(30));
+        assert_eq!(pick_pre_version(&hist, 4), Some(20));
+        assert_eq!(pick_pre_version(&hist, 3), Some(10), "only seq 1 is below 3 here");
+        // nothing smaller ⇒ created in this batch
+        assert_eq!(pick_pre_version(&hist, 1), None);
+        // unsorted input still works (maximum smaller seq, not first match)
+        let unsorted = vec![ver(10, 1), ver(30, 5), ver(20, 3)];
+        assert_eq!(pick_pre_version(&unsorted, 4), Some(20));
+        assert_eq!(pick_pre_version(&unsorted, 1), None);
+    }
+
+    #[test]
+    fn batch_block_created_in_batch_has_empty_left() {
+        let _guard = crate::state::LOCALE_TEST_LOCK.lock().unwrap();
+        rust_i18n::set_locale("en");
+        let v = ver(40, 4);
+        // created in this batch: no pre-batch version — empty left, hunks from empty
+        let hunks = [hunk(1, 0, 1, 2, "hello\nworld\n")];
+        let m = build_batch_block(&v, &[], b"hello\nworld\n", Some(&hunks));
+        assert_eq!(m.left_title, "Before batch");
+        assert_eq!(m.right_title, "In batch (seq 4)");
+        assert!(!m.binary);
+        assert!(!m.identical);
+        assert!(m.left.iter().all(|l| l.no.is_none()), "left rows are fillers (no pre-batch lines)");
+        assert_eq!(texts(&m, |m| &m.right), vec!["hello\n", "world\n"]);
+        assert_eq!(m.right.iter().filter(|l| l.add).count(), 2);
+    }
+
+    #[test]
+    fn batch_block_deleted_in_batch_has_empty_right() {
+        let mut v = ver(30, 3);
+        v.kind = EventKind::Delete;
+        let hunks = [hunk(1, 3, 1, 0, "")];
+        let m = build_batch_block(&v, b"a\nb\nc\n", &[], Some(&hunks));
+        // every left row is a deletion, the right side carries no content
+        assert!(m.left.iter().all(|l| l.del));
+        assert!(m.right.iter().all(|l| l.text.is_empty()), "deleted in batch ⇒ empty right");
+        assert!(!m.identical);
+        // even stale bytes passed by a caller are forced away from the right pane
+        let m = build_batch_block(&v, b"a\n", b"STALE", Some(&hunks));
+        assert!(m.right.iter().all(|l| l.text.is_empty()));
+    }
+
+    #[test]
+    fn batch_block_binary_shows_note_only() {
+        let v = ver(50, 5);
+        // non-UTF8 on the batch side — no rows, only the binary note
+        let m = build_batch_block(&v, b"text\n", &[0x80, 0x81], Some(&[]));
+        assert!(m.binary);
+        assert!(m.note.is_some());
+        assert!(m.left.is_empty() && m.right.is_empty());
+        // non-UTF8 on the pre side renders the same note
+        let m = build_batch_block(&v, &[0xff], b"text\n", Some(&[]));
+        assert!(m.binary);
+        // the engine refusing to diff (BinaryContent) → no hunks ⇒ same note
+        let m = build_batch_block(&v, b"\xff", b"\x80", None);
+        assert!(m.binary);
+        assert!(m.note.is_some());
+    }
+
+    #[test]
+    fn batch_block_identical_shares_note_text_with_show_diff() {
+        let _guard = crate::state::LOCALE_TEST_LOCK.lock().unwrap();
+        rust_i18n::set_locale("en");
+        let v = ver(60, 6);
+        let m = build_batch_block(&v, b"a\nb\n", b"a\nb\n", Some(&[]));
+        assert!(m.identical);
+        assert!(!m.binary);
+        assert_eq!(m.left.len(), 2);
+        assert_eq!(m.right.len(), 2);
+        assert!(m.left.iter().chain(m.right.iter()).all(|l| !l.del && !l.add));
+        // zero hunks ⇒ the same "identical" note the single-file diff shows
+        assert_eq!(
+            diff_view::note_text(&m),
+            Some("Both sides are identical.".to_string())
+        );
+        rust_i18n::set_locale("en");
+    }
+
+    /// Block fixture: rel path + a default model.
+    fn block(rel: &str) -> BatchBlock {
+        BatchBlock {
+            rel_path: rel.to_string(),
+            kind: EventKind::External,
+            size: 0,
+            model: DiffModel::default(),
+        }
+    }
+
+    #[test]
+    fn batch_focus_block_maps_entry_index_to_its_block() {
+        let blocks = vec![block("a.txt"), block("b.txt"), block("b.txt"), block("c.txt")];
+        // duplicate rel_path: the index picks the block the user clicked, not
+        // the first one carrying that path
+        assert_eq!(batch_focus_block(&blocks, Some((0, "a.txt"))), Some(0));
+        assert_eq!(batch_focus_block(&blocks, Some((1, "b.txt"))), Some(1));
+        assert_eq!(
+            batch_focus_block(&blocks, Some((2, "b.txt"))),
+            Some(2),
+            "second entry of a twice-changed file ⇒ second block"
+        );
+        assert_eq!(batch_focus_block(&blocks, Some((3, "c.txt"))), Some(3));
+        assert_eq!(batch_focus_block(&blocks, None), None, "no focus ⇒ no block");
+    }
+
+    #[test]
+    fn batch_focus_block_drops_a_stale_index() {
+        let blocks = vec![block("a.txt"), block("b.txt"), block("b.txt")];
+        // entries reloaded between click and draw (GC / batch switch): a
+        // mismatched path or an out-of-bounds index scrolls nowhere
+        assert_eq!(
+            batch_focus_block(&blocks, Some((2, "c.txt"))),
+            None,
+            "path mismatch ⇒ None"
+        );
+        assert_eq!(
+            batch_focus_block(&blocks, Some((3, "b.txt"))),
+            None,
+            "index past the end ⇒ None"
+        );
+        assert_eq!(batch_focus_block(&blocks, Some((0, "gone.txt"))), None);
+    }
+
+    #[test]
+    fn batch_entries_fingerprint_separates_cleared_from_loaded() {
+        assert_eq!(batch_entries_fingerprint(&[]), 0, "cleared/pending list");
+        let mk = |rel: &str, id: i64| BatchEntry { rel_path: rel.into(), version: ver(id, 1) };
+        let one = vec![mk("a.txt", 7)];
+        let two = vec![mk("a.txt", 7), mk("b.txt", 11)];
+        assert_eq!(
+            batch_entries_fingerprint(&two),
+            batch_entries_fingerprint(&two.clone()),
+            "stable across polls (same list ⇒ same fingerprint)"
+        );
+        assert_ne!(
+            batch_entries_fingerprint(&one),
+            batch_entries_fingerprint(&two),
+            "the click-frame refill (cleared → loaded) must change the fingerprint"
+        );
+        assert_ne!(
+            batch_entries_fingerprint(&two),
+            batch_entries_fingerprint(&[mk("a.txt", 7), mk("b.txt", 12)]),
+            "different version ids ⇒ different fingerprint"
+        );
+    }
+
+    #[test]
+    fn batch_view_i18n_keys_en_vi() {
+        // explicit-locale lookups — process-global state untouched
+        assert_eq!(t!("batch.view_left_title", locale = "en"), "Before batch");
+        assert_eq!(t!("batch.view_left_title", locale = "vi"), "Trước đợt");
+        assert_eq!(t!("batch.view_right_title", locale = "en", seq = 7), "In batch (seq 7)");
+        assert_eq!(t!("batch.view_right_title", locale = "vi", seq = 7), "Trong đợt (seq 7)");
     }
 }

@@ -31,6 +31,8 @@ batch:
   report: "batch reverted — %{reverted} reverted · %{restored} restored · %{deleted} deleted · %{skipped} skipped"
   report_errors: "%{n} file(s) failed"
   badge_tip: "part of batch #%{id} (%{count})"
+  view_left_title: "Before batch"
+  view_right_title: "In batch (seq %{seq})"
   err_list: "failed to read batches: %{e}"
   err_revert: "batch revert failed: %{e}"
   err_map: "failed to read batch badges: %{e}"

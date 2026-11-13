@@ -31,6 +31,8 @@ batch:
   report: "đã revert cả đợt — %{reverted} revert · %{restored} khôi phục · %{deleted} xóa · %{skipped} bỏ qua"
   report_errors: "%{n} file lỗi"
   badge_tip: "thuộc đợt #%{id} (%{count})"
+  view_left_title: "Trước đợt"
+  view_right_title: "Trong đợt (seq %{seq})"
   err_list: "Lỗi đọc danh sách đợt: %{e}"
   err_revert: "Revert cả đợt thất bại: %{e}"
   err_map: "Lỗi đọc badge đợt: %{e}"
