@@ -714,6 +714,19 @@ fn s9_self_update(ctx: &Ctx) -> Res {
     let install2 = temp_dir("second install dir")?;
     let dist2 = temp_dir("second dist dir")?;
     io(fs::write(install2.path().join(&exe_name), &lh_bytes), "failed to write install2 exe")?;
+    // same Unix requirement as the first install copy: the file must be
+    // runnable for the rollback-case self-update process to start at all
+    #[cfg(unix)]
+    io(
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                install2.path().join(&exe_name),
+                fs::Permissions::from_mode(0o755),
+            )
+        },
+        "failed to chmod the install2 exe",
+    )?;
     io(
         fs::write(install2.path().join("VERSION.txt"), "original\n"),
         "failed to write install2 VERSION.txt",
