@@ -1,0 +1,16 @@
+[package]
+name = "e2e"
+version.workspace = true
+edition.workspace = true
+description = "Process-level end-to-end runner (real daemon + real CLI, cross-platform)"
+publish = false
+
+[[bin]]
+name = "lh-e2e"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+sha2 = { workspace = true }

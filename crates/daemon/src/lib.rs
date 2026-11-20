@@ -143,6 +143,13 @@ pub fn run_with_root_paused(
         dirs.push(normalize_path(d).map_err(DaemonError::Path)?);
     }
     let engine = Arc::new(LocalHistory::open(store_root)?);
+    // Test/tuning hook: shrink the auto-batch window/timeout via env (the
+    // engine keeps its defaults; only the daemon applies the override). A
+    // malformed value falls back to the default — it must never stop the
+    // daemon from starting.
+    let batch_window = env_u64("LH_BATCH_WINDOW_MS", 3_000);
+    let batch_timeout = env_u64("LH_BATCH_TIMEOUT_MS", 5_000).max(batch_window);
+    engine.set_batch_policy(batch_window, batch_timeout);
     let mut ws_entries: Vec<(PathBuf, WorkspaceId)> = Vec::with_capacity(dirs.len());
     for dir in &dirs {
         let ws = engine.register_workspace(dir)?;
@@ -540,6 +547,15 @@ fn write_status(store_root: &Path, status: &DaemonStatus) -> Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(store_root.join("daemon.json"), data)?;
     Ok(())
+}
+
+/// u64 from an env var, or `default` when unset/unparsable — the e2e/tuning
+/// hook for the batch policy; a malformed value never stops the daemon.
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 /// Absorbs one event: only Create/Modify/Remove are kept (Access/Other dropped); the path

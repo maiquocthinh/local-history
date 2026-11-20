@@ -25,3 +25,7 @@ winresource = "0.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Functional UI tests (headless): the base harness needs NO renderer — only the
+# optional snapshot/image features pull in wgpu, which this machine avoids.
+# The "eframe" feature enables Harness::build_eframe (drives a real eframe App).
+egui_kittest = { version = "0.37", default-features = false, features = ["eframe"] }
