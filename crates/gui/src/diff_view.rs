@@ -2,6 +2,7 @@
 //! hunks and renders them side by side (a single `ScrollArea::show_rows` keeps
 //! both panes' scrolling in sync).
 
+use crate::icons;
 use eframe::egui;
 use history::Hunk;
 use rust_i18n::t;
@@ -358,7 +359,10 @@ fn line_chars(l: &Line) -> usize {
 /// `None` when the cell is outside the selection. `len` = the cell's char
 /// count (0 for filler/missing cells). Editor convention: the `from` cell
 /// keeps its tail `[from.col .. len)`, the `to` cell its head `[0 .. to.col)`,
-/// and cells in between are taken full-length.
+/// and cells in between are taken full-length — but ONLY for a cross-pane
+/// selection; a same-pane selection never touches the other pane, even cells
+/// that sit "between" its ends in row-major order (left row N sits between
+/// right row N-1 and right row N).
 fn cell_selected_cols(
     from: CaretPos,
     to: CaretPos,
@@ -366,6 +370,9 @@ fn cell_selected_cols(
     pane: Pane,
     len: usize,
 ) -> Option<(usize, usize)> {
+    if from.pane == to.pane && pane != from.pane {
+        return None;
+    }
     let cell = (row, pane);
     let from_cell = (from.row, from.pane);
     let to_cell = (to.row, to.pane);
@@ -389,10 +396,12 @@ fn cell_selected_cols(
 }
 
 /// Raw text of the selected cells: each in-range cell contributes its selected
-/// substring (terminator stripped, tabs kept verbatim), joined with `\n` in
-/// display order (row-major, left before right). Rows/cols out of the model (a
-/// stale selection right after the diff pair changed) are skipped — this never
-/// panics. A collapsed selection yields "".
+/// substring (terminator stripped, tabs kept verbatim), joined with `\n`. Both
+/// ends in one pane (the UI guarantees this via [`confine_cursor`]) copy ONLY
+/// that pane's lines; differing panes (a stale selection right after the diff
+/// pair changed) fall back to display order (row-major, left before right).
+/// Rows/cols out of the model are skipped — this never panics. A collapsed
+/// selection yields "".
 pub fn selection_text(model: &DiffModel, sel: &TextSelection) -> String {
     match sel.normalized() {
         Some((from, to)) => selection_segments(model, from, to).join("\n"),
@@ -400,7 +409,7 @@ pub fn selection_text(model: &DiffModel, sel: &TextSelection) -> String {
     }
 }
 
-/// The selected substring of every in-range cell, in display order. Empty
+/// The selected substring of every in-range cell, in iteration order. Empty
 /// ranges (filler rows, end-of-line carets) keep an empty segment so the join
 /// preserves blank lines.
 fn selection_segments(model: &DiffModel, from: CaretPos, to: CaretPos) -> Vec<String> {
@@ -458,13 +467,129 @@ fn cell_caret(c: &CellGeom<'_>, pointer_x: f32, char_w: f32) -> CaretPos {
     caret_from_pointer(pointer_x, c.rect.left() + GUTTER, char_w, max_col, c.row, c.pane)
 }
 
+/// What [`show_diff`] did this frame — the caller translates actions into
+/// toasts; the engine-backed patch copy stays in app.rs (store access never
+/// reaches this module).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffAction {
+    /// The raw text of the selection was copied to the clipboard (Ctrl+C or
+    /// the context-menu item); the value = non-empty lines copied.
+    CopiedSelection(usize),
+    /// One pane's full text was copied via the context menu; value = lines.
+    CopiedPane(usize),
+    /// The context-menu "copy diff (patch)" item was clicked — the caller
+    /// fetches the ENGINE's unified diff itself.
+    CopyUnified,
+}
+
+/// Whole-pane text: every line's content (terminator stripped) joined with
+/// `\n` — the context-menu "copy left/right pane" payload. A filler row
+/// contributes an empty segment (a blank line in the copy).
+fn pane_text(model: &DiffModel, pane: Pane) -> String {
+    let lines = match pane {
+        Pane::Left => &model.left,
+        Pane::Right => &model.right,
+    };
+    lines.iter().map(line_content).collect::<Vec<_>>().join("\n")
+}
+
+/// Char count of one pane's line at `row` — the column space a cross-pane
+/// caret is clamped onto (0 for a missing/filler row).
+fn pane_row_len(model: &DiffModel, pane: Pane, row: usize) -> usize {
+    let lines = match pane {
+        Pane::Left => &model.left,
+        Pane::Right => &model.right,
+    };
+    lines.get(row).map(line_chars).unwrap_or(0)
+}
+
+/// The moving end of a selection never leaves the anchor's pane (editor
+/// convention — dragging across the gutter does not extend the selection
+/// into the neighbouring pane). A caret in the other pane is remapped onto
+/// the anchor's pane at the same row, column clamped to that row's end; a
+/// caret already in the anchor's pane — or an unset anchor (defensive) —
+/// passes through.
+fn confine_cursor(sel: &TextSelection, model: &DiffModel, c: CaretPos) -> CaretPos {
+    match sel.anchor {
+        Some(a) if a.pane != c.pane => CaretPos {
+            row: c.row,
+            pane: a.pane,
+            col: pane_row_len(model, a.pane, c.row),
+        },
+        _ => c,
+    }
+}
+
+/// The context menu of a right-clicked diff cell (both panes share it).
+/// Performs the copies directly on the clipboard and records what happened
+/// into the caller's locals — the toast text differs per action, so the
+/// caller ([`show_diff`]) turns them into a [`DiffAction`]. Items are styled
+/// as flat full-width rows (the combo-box popup look), not floating buttons.
+fn show_cell_menu(
+    ui: &mut egui::Ui,
+    model: &DiffModel,
+    sel: &TextSelection,
+    allow_unified: bool,
+    copied_sel: &mut Option<usize>,
+    copied_pane: &mut Option<usize>,
+    want_unified: &mut bool,
+) {
+    // menu-item styling: tight stack, equal width, flat rows that highlight
+    // on hover (SelectableLabel = egui's own dropdown-item look)
+    ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
+    ui.style_mut().spacing.button_padding = egui::vec2(10.0, 4.0);
+    ui.set_min_width(200.0);
+    let item = |ui: &mut egui::Ui, enabled: bool, text: String| -> bool {
+        ui.add_enabled(enabled, egui::Button::selectable(false, text)).clicked()
+    };
+
+    if item(ui, !sel.is_empty(), format!("{} {}", icons::COPY, t!("diff.menu_copy_selection"))) {
+        let text = selection_text(model, sel);
+        let n = text.lines().filter(|l| !l.is_empty()).count();
+        if n > 0 {
+            ui.ctx().copy_text(text);
+            *copied_sel = Some(n);
+        }
+        ui.close();
+    }
+    if item(ui, !model.left.is_empty(), format!("{} {}", icons::COPY, t!("diff.menu_copy_left"))) {
+        ui.ctx().copy_text(pane_text(model, Pane::Left));
+        *copied_pane = Some(model.left.len());
+        ui.close();
+    }
+    if item(
+        ui,
+        !model.right.is_empty(),
+        format!("{} {}", icons::COPY, t!("diff.menu_copy_right")),
+    ) {
+        ui.ctx().copy_text(pane_text(model, Pane::Right));
+        *copied_pane = Some(model.right.len());
+        ui.close();
+    }
+    // a thin divider with a little breathing room — not a fat gap block
+    ui.add_space(3.0);
+    ui.separator();
+    ui.add_space(3.0);
+    if item(ui, allow_unified, format!("{} {}", icons::COPY, t!("diff.copy"))) {
+        *want_unified = true;
+        ui.close();
+    }
+}
+
 /// Renders the diff model into the center panel: two column headings +
 /// side-by-side rows. Also handles char-level selection (drag / shift+click on
-/// the diff cells, editor style) and Ctrl+C (`egui::Event::Copy` — egui-winit
-/// turns the Ctrl+C / Ctrl+Insert chord into this event, so a `Key::C` press
-/// never fires): returns `Some(n)` when the raw text of `n` non-empty selected
-/// cells was just copied to the clipboard (the caller shows the toast).
-pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) -> Option<usize> {
+/// the diff cells, editor style — a selection stays inside the pane it
+/// started in), Ctrl+C (`egui::Event::Copy` — egui-winit turns the Ctrl+C /
+/// Ctrl+Insert chord into this event, so a `Key::C` press never fires) and a
+/// right-click context menu with the copy actions. `allow_unified` enables
+/// the "copy diff (patch)" menu item (the caller then copies the engine's
+/// unified diff on [`DiffAction::CopyUnified`]); returns what was just done.
+pub fn show_diff(
+    ui: &mut egui::Ui,
+    model: &DiffModel,
+    sel: &mut TextSelection,
+    allow_unified: bool,
+) -> Option<DiffAction> {
     let total = model.left.len().max(model.right.len());
     if let Some(note) = note_text(model) {
         ui.vertical_centered(|ui| {
@@ -490,6 +615,11 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) 
     let mut drag_pos = None; // dragged/drag_stopped: cursor follows the pointer
     let mut click_pos = None; // clicked (press + release, no drag)
     let shift = ui.input(|i| i.modifiers.shift);
+    // context-menu results (the copies happen inside show_cell_menu; the
+    // caller only needs to know which toast to show)
+    let mut copied_sel: Option<usize> = None;
+    let mut copied_pane: Option<usize> = None;
+    let mut want_unified = false;
 
     // ONE ScrollArea walking row indexes → both columns in the same row ⇒
     // scrolling stays in sync naturally.
@@ -532,6 +662,29 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) 
                     if rr.clicked() {
                         click_pos = rr.interact_pointer_pos();
                     }
+                    // right-click on either cell opens the shared copy menu
+                    rl.context_menu(|ui| {
+                        show_cell_menu(
+                            ui,
+                            model,
+                            sel,
+                            allow_unified,
+                            &mut copied_sel,
+                            &mut copied_pane,
+                            &mut want_unified,
+                        )
+                    });
+                    rr.context_menu(|ui| {
+                        show_cell_menu(
+                            ui,
+                            model,
+                            sel,
+                            allow_unified,
+                            &mut copied_sel,
+                            &mut copied_pane,
+                            &mut want_unified,
+                        )
+                    });
                 });
             }
 
@@ -550,11 +703,12 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) 
                 });
                 ui.ctx().request_repaint();
             }
-            // dragging: the cursor follows the pointer
+            // dragging: the cursor follows the pointer (confined to the
+            // anchor's pane — a drag across the gutter never leaks there)
             if let Some(pos) = drag_pos
                 && let Some(c) = caret_at_screen_pos(pos, &cells, layout.char_w)
             {
-                sel.cursor = Some(c);
+                sel.cursor = Some(confine_cursor(sel, model, c));
                 ui.ctx().request_repaint();
             }
             // plain click: collapse the selection onto the click position;
@@ -569,7 +723,7 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) 
                     }
                 });
                 if shift && sel.anchor.is_some() {
-                    sel.cursor = Some(c);
+                    sel.cursor = Some(confine_cursor(sel, model, c));
                 } else {
                     sel.anchor = Some(c);
                     sel.cursor = Some(c);
@@ -593,8 +747,19 @@ pub fn show_diff(ui: &mut egui::Ui, model: &DiffModel, sel: &mut TextSelection) 
         let n = text.lines().filter(|l| !l.is_empty()).count();
         if n > 0 {
             ui.ctx().copy_text(text);
-            return Some(n);
+            return Some(DiffAction::CopiedSelection(n));
         }
+    }
+    // context-menu actions performed this frame (same one-frame latency as
+    // the selection updates above)
+    if let Some(n) = copied_sel {
+        return Some(DiffAction::CopiedSelection(n));
+    }
+    if let Some(n) = copied_pane {
+        return Some(DiffAction::CopiedPane(n));
+    }
+    if want_unified {
+        return Some(DiffAction::CopyUnified);
     }
     None
 }
@@ -904,9 +1069,10 @@ mod tests {
     fn multi_row_range_takes_full_middle_cells() {
         let m = test_model();
         // from the middle of left row 0 to the middle of left row 1:
-        // from-cell tail + FULL in-between cells + to-cell head
+        // from-cell tail + full in-between LEFT cells + to-cell head — a
+        // same-pane selection never includes the other pane's cells
         let sel = sel_from_to(caret(0, Pane::Left, 2), caret(1, Pane::Left, 3));
-        assert_eq!(selection_text(&m, &sel), "pha\nalpha\nold");
+        assert_eq!(selection_text(&m, &sel), "pha\nold");
     }
 
     #[test]
@@ -935,8 +1101,9 @@ mod tests {
         let sel = sel_from_to(caret(10, Pane::Left, 0), caret(12, Pane::Right, 4));
         assert_eq!(selection_text(&m, &sel), "");
         // columns past the end clamp; the from-cell at EOL copies nothing
+        // (same-pane selection → right-pane cells only)
         let sel = sel_from_to(caret(1, Pane::Right, 100), caret(2, Pane::Right, 2));
-        assert_eq!(selection_text(&m, &sel), "\n\nex");
+        assert_eq!(selection_text(&m, &sel), "\nex");
         // a cursor row beyond the model extends the copy to the model's end
         let sel = sel_from_to(caret(2, Pane::Left, 0), caret(99, Pane::Right, 2));
         assert_eq!(selection_text(&m, &sel), "\nextra");
@@ -968,5 +1135,84 @@ mod tests {
             ..m
         };
         assert_eq!(selection_text(&shorter, &sel), "");
+    }
+
+    // ----- pane confinement: a drag never extends into the other pane -----
+
+    #[test]
+    fn cell_selected_cols_same_pane_never_takes_the_other_pane() {
+        // same-pane selection spanning rows: the OTHER pane's cells are not
+        // selected, even "in-between" ones in row-major order (the highlight
+        // bug: left rows 1→2 must not highlight right row 1)
+        let from = caret(0, Pane::Left, 0);
+        let to = caret(1, Pane::Left, 8);
+        assert_eq!(cell_selected_cols(from, to, 0, Pane::Left, 5), Some((0, 5)));
+        assert_eq!(cell_selected_cols(from, to, 1, Pane::Left, 8), Some((0, 8)));
+        assert_eq!(cell_selected_cols(from, to, 0, Pane::Right, 5), None);
+        assert_eq!(cell_selected_cols(from, to, 1, Pane::Right, 8), None);
+        // mirrored: right-pane rows 1→2 must not highlight left row 2 (the
+        // cell that sits between right rows 1 and 2 in row-major order)
+        let from = caret(1, Pane::Right, 0);
+        let to = caret(2, Pane::Right, 4);
+        assert_eq!(cell_selected_cols(from, to, 2, Pane::Left, 0), None);
+        // a cross-pane (stale) selection keeps the row-major in-between rule
+        let from = caret(0, Pane::Left, 0);
+        let to = caret(2, Pane::Right, 2);
+        assert_eq!(cell_selected_cols(from, to, 1, Pane::Left, 8), Some((0, 8)));
+        assert_eq!(cell_selected_cols(from, to, 1, Pane::Right, 8), Some((0, 8)));
+    }
+
+    #[test]
+    fn confine_cursor_stays_in_anchor_pane() {
+        let m = test_model();
+        let sel = sel_from_to(caret(0, Pane::Left, 0), caret(0, Pane::Left, 0));
+        // pointer dragged over the RIGHT pane at row 1 → remapped onto the
+        // anchor pane's end of that row ("old line" = 8 chars)
+        let c = confine_cursor(&sel, &m, caret(1, Pane::Right, 3));
+        assert_eq!(c, caret(1, Pane::Left, 8));
+        // a caret already in the anchor's pane passes through untouched
+        assert_eq!(confine_cursor(&sel, &m, caret(2, Pane::Left, 1)), caret(2, Pane::Left, 1));
+        // the confined selection copies ONLY left-pane lines
+        let sel = TextSelection { anchor: Some(caret(0, Pane::Left, 0)), cursor: Some(c) };
+        assert_eq!(selection_text(&m, &sel), "alpha\nold line");
+    }
+
+    #[test]
+    fn confine_cursor_right_anchor_maps_to_right_pane() {
+        let m = test_model();
+        let sel = sel_from_to(caret(1, Pane::Right, 0), caret(1, Pane::Right, 0));
+        // dragged into the LEFT pane at row 2 → remapped onto the anchor
+        // pane's own row 2 ("extra" = 5 chars), NOT the hovered pane's length
+        assert_eq!(confine_cursor(&sel, &m, caret(2, Pane::Left, 5)), caret(2, Pane::Right, 5));
+        // dragged into the LEFT pane at row 0 → right pane's row 0 end ("alpha")
+        assert_eq!(confine_cursor(&sel, &m, caret(0, Pane::Left, 1)), caret(0, Pane::Right, 5));
+    }
+
+    #[test]
+    fn confine_cursor_without_anchor_passes_through() {
+        let m = test_model();
+        assert_eq!(
+            confine_cursor(&TextSelection::default(), &m, caret(1, Pane::Right, 3)),
+            caret(1, Pane::Right, 3)
+        );
+    }
+
+    #[test]
+    fn pane_text_strips_terminators() {
+        let m = test_model();
+        // filler row contributes a blank line (trailing empty segment)
+        assert_eq!(pane_text(&m, Pane::Left), "alpha\nold line\n");
+        assert_eq!(pane_text(&m, Pane::Right), "alpha\nnew line\nextra");
+        // note-only model (empty panes) → empty text
+        assert_eq!(pane_text(&DiffModel::empty_note("gone"), Pane::Left), "");
+    }
+
+    #[test]
+    fn pane_row_len_clamps_missing_rows() {
+        let m = test_model();
+        assert_eq!(pane_row_len(&m, Pane::Left, 1), 8); // "old line"
+        assert_eq!(pane_row_len(&m, Pane::Left, 2), 0); // filler row
+        assert_eq!(pane_row_len(&m, Pane::Left, 99), 0); // beyond the model
+        assert_eq!(pane_row_len(&m, Pane::Right, 2), 5); // "extra"
     }
 }

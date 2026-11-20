@@ -1356,22 +1356,8 @@ impl App {
             if self.diff_mode == DiffMode::AnyTwo {
                 self.any_two_pickers(ui);
             }
-            // Copy diff: the ENGINE's unified diff of the current pair;
-            // disabled with no renderable model (nothing picked yet) or binary.
-            let can_copy_diff = self
-                .diff_cache
-                .as_ref()
-                .is_some_and(|c| !c.model.binary && c.model.note.is_none());
-            if ui
-                .add_enabled(
-                    can_copy_diff,
-                    egui::Button::new(format!("{} {}", icons::COPY, t!("diff.copy"))),
-                )
-                .on_hover_text(t!("diff.copy_tip"))
-                .clicked()
-            {
-                self.copy_unified_diff(ui.ctx());
-            }
+            // NOTE: "copy diff (patch)" lives in the diff view's right-click
+            // context menu now (was a button here).
         });
         ui.separator();
 
@@ -1400,18 +1386,31 @@ impl App {
             });
         }
         // split borrows: the cache is shared while the selection is mutated;
-        // `Some(n)` = the raw text of n non-empty selected cells was copied
-        // (Ctrl+C)
+        // `can_copy_diff` gates the context-menu's "copy diff (patch)" item
+        // the same way the old button was gated (renderable, non-binary model)
+        let can_copy_diff = self
+            .diff_cache
+            .as_ref()
+            .is_some_and(|c| !c.model.binary && c.model.note.is_none());
         let copied = if let Some(c) = &self.diff_cache {
             let mut sel = std::mem::take(&mut self.diff_selection);
-            let copied = diff_view::show_diff(ui, &c.model, &mut sel);
+            let copied = diff_view::show_diff(ui, &c.model, &mut sel, can_copy_diff);
             self.diff_selection = sel;
             copied
         } else {
             None
         };
-        if let Some(n) = copied {
-            self.set_status(t!("diff.copied", n = n).to_string(), true);
+        match copied {
+            Some(diff_view::DiffAction::CopiedSelection(n)) => {
+                self.set_status(t!("diff.copied", n = n).to_string(), true);
+            }
+            Some(diff_view::DiffAction::CopiedPane(n)) => {
+                self.set_status(t!("diff.copied_pane", n = n).to_string(), true);
+            }
+            Some(diff_view::DiffAction::CopyUnified) => {
+                self.copy_unified_diff(ui.ctx());
+            }
+            None => {}
         }
     }
 
