@@ -636,6 +636,18 @@ fn s9_self_update(ctx: &Ctx) -> Res {
     let install = temp_dir("install dir")?;
     let dist = temp_dir("dist dir")?;
     io(fs::write(install.path().join(&exe_name), &lh_bytes), "failed to write the install exe")?;
+    // the copy must be runnable on Unix (fs::write creates a 0644 file)
+    #[cfg(unix)]
+    io(
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                install.path().join(&exe_name),
+                fs::Permissions::from_mode(0o755),
+            )
+        },
+        "failed to chmod the install exe",
+    )?;
     io(
         fs::write(install.path().join("VERSION.txt"), "install version 1\n"),
         "failed to write the install VERSION.txt",

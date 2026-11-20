@@ -350,6 +350,18 @@ pub fn prepare_in(opts: &UpdateOpts, exe_dir: &Path) -> Result<Prepared, UpdateE
             let staged_path = exe_dir.join(format!("{STALE_NEW_PREFIX}{pid}-{}", artifact.name));
             let bytes = source.fetch(&artifact.name)?;
             fs::write(&staged_path, &bytes)?;
+            // Preserve the target's permission bits on Unix: the swap renames
+            // the staged file over the target, so a plain 0644 staged file
+            // would make the updated `lh` non-executable. A target that does
+            // not exist yet defaults to 0755 (the updater ships executables).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(exe_dir.join(&artifact.name))
+                    .map(|m| m.permissions().mode() & 0o777)
+                    .unwrap_or(0o755);
+                fs::set_permissions(&staged_path, fs::Permissions::from_mode(mode))?;
+            }
             let actual = sha256_file(&staged_path)?;
             if actual != expected {
                 let _ = fs::remove_file(&staged_path);
