@@ -1,16 +1,16 @@
-﻿//! Functional UI tests â€” drive the REAL `App` headlessly through
+//! Functional UI tests — drive the REAL `App` headlessly through
 //! `egui_kittest` (AccessKit-based; no renderer: the snapshot/wgpu features
 //! stay OFF, so this never touches the GPU stack).
 //!
 //! Determinism:
 //! - locale is pinned to English by pre-writing `gui-state.json` with
-//!   `"lang": "en"` BEFORE `App::new` runs â€” every asserted label is English;
+//!   `"lang": "en"` BEFORE `App::new` runs — every asserted label is English;
 //! - content assertions use technical strings (file names, `seq N`, kind
 //!   values like "external") which are never translated;
 //! - every test seeds its own temp store through the `history` engine API
 //!   (no daemon, no network, no real window).
 //!
-//! The `probe_accessibility_tree` test dumps every labelled node â€” run it with
+//! The `probe_accessibility_tree` test dumps every labelled node — run it with
 //! `cargo test -p gui --test kittest probe -- --nocapture` when a query comes
 //! up empty and an assertion needs a new anchor.
 
@@ -24,7 +24,7 @@ use history::{EventKind, LocalHistory, WorkspaceId};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
-// Seeding â€” records inside the auto-batch window (shrunk via set_batch_policy)
+// Seeding — records inside the auto-batch window (shrunk via set_batch_policy)
 // form one batch each, so the activity tab has real batches to show.
 // ---------------------------------------------------------------------------
 
@@ -65,7 +65,7 @@ fn seed_versions(n: usize) -> Seed {
 }
 
 /// 3 config files created in one wave (batch #1) then modified in a second
-/// wave spaced >500ms apart (batch #2) â€” two auto batches for the activity tab.
+/// wave spaced >500ms apart (batch #2) — two auto batches for the activity tab.
 fn seed_batches() -> Seed {
     let store = TempDir::new().unwrap();
     let ws = TempDir::new().unwrap();
@@ -105,7 +105,7 @@ fn make_harness(seed: &Seed, initial_file: Option<&Path>) -> Harness<'static, Ap
     Harness::builder()
         .with_size(egui::Vec2::new(1280.0, 800.0))
         // unnamed input widgets exist on purpose (the diff grid cells and the
-        // icon-only buttons) â€” the strict a11y naming check would reject them
+        // icon-only buttons) — the strict a11y naming check would reject them
         .with_accessibility_check(false)
         .with_context_setup(|ctx| {
             ctx.set_theme(egui::Theme::Dark);
@@ -118,7 +118,7 @@ fn make_harness(seed: &Seed, initial_file: Option<&Path>) -> Harness<'static, Ap
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Dumps EVERY node (role + label + rect, rectless nodes marked) â€” the anchor
+/// Dumps EVERY node (role + label + rect, rectless nodes marked) — the anchor
 /// catalog for the other tests. Run:
 /// `cargo test -p gui --test kittest probe -- --nocapture`.
 #[test]
@@ -129,7 +129,7 @@ fn probe_accessibility_tree() {
     select_notes(&mut h, &s);
     h.run();
 
-    // Node::rect() panics on rectless nodes (the root) â€” silence the hook and
+    // Node::rect() panics on rectless nodes (the root) — silence the hook and
     // mark them instead of blowing up the dump
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -152,7 +152,7 @@ fn probe_accessibility_tree() {
         h.query_all(By::new().role(egui::accesskit::Role::Button)).count()
             + h.query_all(By::new().role(egui::accesskit::Role::Label)).count()
             > 0,
-        "accessibility tree is empty â€” the app did not render"
+        "accessibility tree is empty — the app did not render"
     );
 }
 
@@ -161,13 +161,19 @@ fn probe_accessibility_tree() {
 /// row explicitly).
 fn select_notes(h: &mut Harness<App>, seed: &Seed) {
     let name = seed.notes.file_name().unwrap().to_string_lossy().to_string();
-    h.get_by_label(&name).click();
+    // the row is not unique on every platform (an exactly-labelled node can
+    // repeat) — tree order puts the file-list row first, take that one
+    let row = h
+        .query_all(By::new().label(&name))
+        .next()
+        .unwrap_or_else(|| panic!("file row `{name}` not found in the tree"));
+    row.click();
     h.run();
 }
 
 /// Rect of the LEFT pane's diff heading. `draw_pane_headings` exposes the
 /// title as a Label whose ACCESSKIT VALUE carries the text ("seq N Â· kind Â·
-/// HH:MM") â€” the label attribute is empty. Timeline rows are a different
+/// HH:MM") — the label attribute is empty. Timeline rows are a different
 /// role (Unknown) with the text in the label, so role+value uniquely finds
 /// the headings; the leftmost is the left pane's.
 fn pane_heading(h: &Harness<App>, contains: &str) -> egui::Rect {
@@ -195,7 +201,7 @@ fn files_tab_shows_file_and_timeline() {
     assert!(h.query_all(By::new().label_contains("seq 3")).count() >= 1, "timeline row seq 3");
     assert!(h.query_all(By::new().label_contains("external")).count() >= 1, "kind external");
     // the diff of the last two versions is open by default (mode Previous):
-    // its content lines are painter-drawn (NOT in the a11y tree) â€” the pane
+    // its content lines are painter-drawn (NOT in the a11y tree) — the pane
     // headings are the accessible anchor, both panes compare seq 2
     assert!(
         h.query_all(By::new().label_contains("seq 2")).count() >= 2,
@@ -233,7 +239,7 @@ fn activity_tab_shows_batches_and_batch_view() {
     h.get_by_label("Activity").click();
     h.run();
 
-    // batch rows are PAINTER-DRAWN (allocate + painter text) â€” intentionally
+    // batch rows are PAINTER-DRAWN (allocate + painter text) — intentionally
     // not in the a11y tree; selecting a batch via the same field a row click
     // sets exercises the identical center-panel code path
     let id = h.state().batches.last().unwrap().id;
@@ -249,7 +255,7 @@ fn activity_tab_shows_batches_and_batch_view() {
         "revert button"
     );
     // NOTE: the per-file block headers are painter-drawn (deliberately not in
-    // the a11y tree, like every custom-drawn cell) â€” their correctness is
+    // the a11y tree, like every custom-drawn cell) — their correctness is
     // covered by the pure builder tests in app.rs; here only the title and
     // the revert action are assertable headlessly.
 }
@@ -264,7 +270,7 @@ fn diff_context_menu_lists_copy_actions() {
     select_notes(&mut h, &s);
     h.run();
 
-    // anchor: the first diff row below the left pane's heading â€” Previous
+    // anchor: the first diff row below the left pane's heading — Previous
     // mode puts the NEWEST version on the left (seq 3), so its heading marks
     // the left pane's column span and the rows start right below it
     let heading = pane_heading(&h, "seq 3");
