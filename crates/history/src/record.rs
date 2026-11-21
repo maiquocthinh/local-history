@@ -98,12 +98,23 @@ impl LocalHistory {
 
         let hash = blake3::hash(content).to_hex().to_string();
 
-        // Dedup: same hash + kind as the latest version → no new version.
-        // Delete is special: if the latest is already a Delete, skip regardless of content.
-        // Rename never dedups — it is an EVENT (path change), not a content change.
+        // Dedup: plain content events (Save/External) are skipped when the content hash
+        // matches the latest version — regardless of kind, because inotify fires a
+        // metadata event right after a rename and it must not become a duplicate row.
+        // Semantic events always record: Rename is an EVENT (path change), Label is a
+        // user marker, PreRevert is a safety snapshot, Restore is a restore event.
+        // Delete stays special: a Delete is redundant only right after another Delete
+        // marker — conversely a marker's empty hash must not swallow a re-created file.
         let dup = match &latest {
             Some(l) if kind == EventKind::Delete => l.kind == EventKind::Delete,
-            Some(l) => kind != EventKind::Rename && l.kind == kind && l.content_hash == hash,
+            Some(l) if matches!(
+                kind,
+                EventKind::Rename | EventKind::Label | EventKind::PreRevert | EventKind::Restore
+            ) =>
+            {
+                false
+            }
+            Some(l) => l.kind != EventKind::Delete && l.content_hash == hash,
             None => false,
         };
         if dup {

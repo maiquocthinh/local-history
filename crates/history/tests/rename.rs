@@ -21,7 +21,9 @@ fn three_versions(
     let p = dir.path().join("a.txt");
     fs::write(&p, b"v1").unwrap();
     store.record(ws, &p, b"v1", EventKind::Save, None).unwrap();
+    fs::write(&p, b"v2").unwrap();
     store.record(ws, &p, b"v2", EventKind::External, None).unwrap();
+    fs::write(&p, b"v3").unwrap();
     store.record(ws, &p, b"v3", EventKind::External, None).unwrap();
     store.history(ws, &p).unwrap()
 }
@@ -59,6 +61,15 @@ fn rename_moves_the_whole_chain() {
     assert!(files.iter().all(|f| f.rel_path != "a.txt"), "path cũ phải biến mất");
     assert!(files.iter().any(|f| f.rel_path == "b.txt"), "path mới phải xuất hiện");
     assert!(store.history(ws, &a).unwrap().is_empty(), "path cũ không còn history");
+
+    // inotify fires a metadata event right after the rename — same content, kind
+    // External instead of Rename — and must dedup (no spurious duplicate row).
+    store.record(ws, &b, b"v3", EventKind::External, None).unwrap();
+    assert_eq!(
+        store.history(ws, &b).unwrap().len(),
+        a_versions.len() + 1,
+        "metadata event sau rename phải dedup"
+    );
 }
 
 #[test]
