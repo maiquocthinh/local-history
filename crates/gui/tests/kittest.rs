@@ -15,6 +15,7 @@
 //! up empty and an assertion needs a new anchor.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use eframe::egui;
 use egui_kittest::kittest::{By, NodeT, Queryable};
@@ -22,6 +23,15 @@ use egui_kittest::Harness;
 use gui::app::App;
 use history::{EventKind, LocalHistory, WorkspaceId};
 use tempfile::TempDir;
+
+/// Serializes every test in this binary: `App::new` sets the PROCESS-GLOBAL
+/// rust-i18n locale, so the vi-locale test running concurrently would flip
+/// the strings under the en tests' feet. Held for the whole test body.
+static LOCALE_LOCK: Mutex<()> = Mutex::new(());
+
+fn locale_guard() -> MutexGuard<'static, ()> {
+    LOCALE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 // ---------------------------------------------------------------------------
 // Seeding — records inside the auto-batch window (shrunk via set_batch_policy)
@@ -97,21 +107,38 @@ fn seed_batches() -> Seed {
 /// Builds the harness around the real `App`. The store's gui-state.json pins
 /// `lang: en` first so `App::new` resolves the locale deterministically (the
 /// process-global locale makes parallel tests safe: every test pins "en").
-fn make_harness(seed: &Seed, initial_file: Option<&Path>) -> Harness<'static, App> {
-    let st = gui::state::GuiState { lang: Some("en".into()), ..Default::default() };
+/// Builds the harness around the real `App`. The store's gui-state.json pins
+/// the locale first so `App::new` resolves it deterministically (the
+/// process-global locale makes parallel tests safe: every test pins its own).
+/// `lang != "en"` also switches missing glyphs to tofu: the bundled fonts
+/// (Ubuntu-Light) have no Vietnamese glyphs and kittest defaults to Panic —
+/// the a11y labels are plain strings, so tofu does not affect the asserts.
+fn make_harness_lang(seed: &Seed, initial_file: Option<&Path>, lang: &str) -> Harness<'static, App> {
+    let st = gui::state::GuiState { lang: Some(lang.into()), ..Default::default() };
     gui::state::save_state(&gui::state::state_path(&seed.store_root), &st).unwrap();
     let store_root = seed.store_root.clone();
     let file = initial_file.map(PathBuf::from);
-    Harness::builder()
+    let is_en = lang == "en";
+    let builder = Harness::builder()
         .with_size(egui::Vec2::new(1280.0, 800.0))
         // unnamed input widgets exist on purpose (the diff grid cells and the
         // icon-only buttons) — the strict a11y naming check would reject them
-        .with_accessibility_check(false)
-        .with_context_setup(|ctx| {
+        .with_accessibility_check(false);
+    // the bundled fonts (Ubuntu-Light) have no Vietnamese glyphs and kittest
+    // panics on missing glyphs by default — tofu keeps the vi test rendering
+    // (a11y labels are plain strings, glyphs don't matter)
+    let builder = if is_en { builder } else { builder.allow_missing_glyphs() };
+    builder
+        .with_context_setup(move |ctx| {
             ctx.set_theme(egui::Theme::Dark);
             gui::icons::install(ctx);
         })
         .build_eframe(move |_cc| App::new(store_root, file))
+}
+
+/// English-locale harness (every pre-existing test pins "en").
+fn make_harness(seed: &Seed, initial_file: Option<&Path>) -> Harness<'static, App> {
+    make_harness_lang(seed, initial_file, "en")
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +150,7 @@ fn make_harness(seed: &Seed, initial_file: Option<&Path>) -> Harness<'static, Ap
 /// `cargo test -p gui --test kittest probe -- --nocapture`.
 #[test]
 fn probe_accessibility_tree() {
+    let _locale = locale_guard();
     let s = seed_versions(3);
     let mut h = make_harness(&s, Some(&s.notes));
     h.run();
@@ -188,6 +216,7 @@ fn pane_heading(h: &Harness<App>, contains: &str) -> egui::Rect {
 /// version rows (`seq N Â· external Â· HH:MM`).
 #[test]
 fn files_tab_shows_file_and_timeline() {
+    let _locale = locale_guard();
     let s = seed_versions(3);
     let mut h = make_harness(&s, Some(&s.notes));
     h.run();
@@ -214,6 +243,7 @@ fn files_tab_shows_file_and_timeline() {
 /// in a headless harness); the panel reacts through its normal cache path.
 #[test]
 fn diff_mode_disk_shows_identical_note() {
+    let _locale = locale_guard();
     let s = seed_versions(2);
     let mut h = make_harness(&s, Some(&s.notes));
     h.run();
@@ -229,6 +259,7 @@ fn diff_mode_disk_shows_identical_note() {
 /// (per-file block headers + revert button + entry list).
 #[test]
 fn activity_tab_shows_batches_and_batch_view() {
+    let _locale = locale_guard();
     let s = seed_batches();
     let mut h = make_harness(&s, None);
     h.run();
@@ -264,6 +295,7 @@ fn activity_tab_shows_batches_and_batch_view() {
 /// regardless of enabled state).
 #[test]
 fn diff_context_menu_lists_copy_actions() {
+    let _locale = locale_guard();
     let s = seed_versions(3);
     let mut h = make_harness(&s, Some(&s.notes));
     h.run();
@@ -302,6 +334,7 @@ fn diff_context_menu_lists_copy_actions() {
 /// cross-pane-leak bug), and it must not be empty.
 #[test]
 fn drag_selection_stays_in_one_pane() {
+    let _locale = locale_guard();
     let s = seed_versions(3);
     let mut h = make_harness(&s, Some(&s.notes));
     h.run();
@@ -356,6 +389,7 @@ fn seed_rename() -> Seed {
 /// diff heading names the same version (`seq N · rename`).
 #[test]
 fn rename_row_shows_kind_and_old_path() {
+    let _locale = locale_guard();
     let s = seed_rename();
     let mut h = make_harness(&s, Some(&s.notes));
     h.run();
@@ -386,6 +420,7 @@ fn rename_row_shows_kind_and_old_path() {
 /// file on disk goes back to v1 byte-exact.
 #[test]
 fn revert_from_gui_restores_disk_content() {
+    let _locale = locale_guard();
     let s = seed_versions(3);
     let mut h = make_harness(&s, Some(&s.notes));
     h.run();
@@ -417,4 +452,185 @@ fn revert_from_gui_restores_disk_content() {
         b"line v1\nsecond line 1\n".to_vec(),
         "GUI revert must restore seq 1's content on disk"
     );
+}
+
+/// Whole-batch revert from the GUI: the confirm modal's action restores every
+/// file of the modification batch to its pre-batch content on disk.
+#[test]
+fn revert_batch_via_gui_restores_files() {
+    let _locale = locale_guard();
+    let s = seed_batches();
+    let mut h = make_harness(&s, None);
+    h.run();
+    h.get_by_label("Activity").click();
+    h.run();
+
+    // select the modification batch — the FIRST row in the Activity tab is the
+    // newest batch (batches() is newest-first), and the user clicks that row
+    let batch = h.state().batches.first().unwrap().clone();
+    h.state_mut().selected_batch = Some(batch.id);
+    h.state_mut().next_poll = None;
+    h.run();
+
+    // open the confirm modal directly (a row click would set the same field),
+    // then click the modal's action button — both the batch view and the
+    // modal carry "Revert whole batch", so pick the LOWEST one on screen (the
+    // modal is vertically centered, the view button sits in the panel top)
+    h.state_mut().confirm_revert_batch = Some(batch.clone());
+    h.run();
+    let nodes: Vec<_> = h
+        .query_all(By::new().label_contains("Revert whole batch"))
+        .collect();
+    assert!(nodes.len() >= 2, "modal + view `Revert whole batch` buttons not found");
+    let modal_btn = nodes
+        .iter()
+        .max_by_key(|n| n.rect().top() as i64)
+        .unwrap();
+    modal_btn.click();
+    h.run();
+    h.run();
+    assert!(
+        h.state().confirm_revert_batch.is_none(),
+        "clicking the modal button must close the modal (revert executed)"
+    );
+
+    // every seeded file is back to its pre-batch content on disk
+    for i in 1..=3 {
+        let p = s._ws.path().join(format!("svc{i}.ini"));
+        let disk = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(
+            disk,
+            format!("app=svc{i}\nretries=3\nmode=normal\n"),
+            "batch revert must restore {p:?} to its pre-batch content"
+        );
+    }
+}
+
+/// Set Label from the GUI: select seq 1, open the label modal, submit — the
+/// version carries the label in the app state (set_label edits in place).
+#[test]
+fn label_via_gui_sets_version_label() {
+    let _locale = locale_guard();
+    let s = seed_versions(3);
+    let mut h = make_harness(&s, Some(&s.notes));
+    h.run();
+    select_notes(&mut h, &s);
+    h.run();
+
+    // select seq 1 in the timeline
+    let row = h
+        .query_all(By::new().label_contains("seq 1"))
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::Unknown)
+        .unwrap_or_else(|| panic!("timeline row `seq 1` not found in the tree"));
+    row.click();
+    h.run();
+
+    // open the label modal (two "Set label" buttons may exist — either opens
+    // the same modal for the selected version), fill the draft, confirm
+    h.query_all(By::new().label_contains("Set label"))
+        .next()
+        .unwrap_or_else(|| panic!("`Set label` button not found"))
+        .click();
+    h.run();
+    h.state_mut().label_draft = "before deploy".into();
+    h.query_all(By::new().label("OK"))
+        .next()
+        .unwrap_or_else(|| panic!("modal `OK` button not found"))
+        .click();
+    h.run();
+    h.run();
+
+    let labeled = h
+        .state()
+        .versions
+        .iter()
+        .find(|v| v.seq == 1)
+        .and_then(|v| v.label.clone())
+        .unwrap_or_else(|| panic!("seq 1 not in the loaded versions"));
+    assert_eq!(labeled, "before deploy", "set_label must reach the version");
+}
+
+/// Kind filter hides everything but the selected kind; the label filter keeps
+/// only versions whose user label contains the query.
+#[test]
+fn kind_and_label_filters_narrow_the_timeline() {
+    let _locale = locale_guard();
+    // --- kind filter on a rename chain (1 rename + 2 external versions) ---
+    let s = seed_rename();
+    let mut h = make_harness(&s, Some(&s.notes));
+    h.run();
+    select_notes(&mut h, &s);
+    h.run();
+
+    // timeline rows are role-Unknown nodes whose label (the tooltip) starts
+    // with "seq N ·" — pane headings are role Label, file rows have no "seq"
+    let visible_rows = |h: &Harness<App>| {
+        h.query_all(By::new().label_contains("seq "))
+            .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::Unknown)
+            .count()
+    };
+    assert_eq!(visible_rows(&h), 3, "unfiltered: rename + 2 external rows");
+
+    h.state_mut().kind_filter = Some(EventKind::Rename);
+    h.run();
+    assert_eq!(visible_rows(&h), 1, "kind=rename leaves exactly one row");
+    let external_rows = h
+        .query_all(By::new().label_contains("· external ·"))
+        .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::Unknown)
+        .count();
+    assert_eq!(external_rows, 0, "external rows must be hidden by the kind filter");
+    h.state_mut().kind_filter = None;
+    h.run();
+
+    // --- label filter: set the label through the GUI's own modal flow ---
+    // (an external engine write is not picked up by the ro connection inside
+    // one test — the GUI's own submit_label goes through its rw connection)
+    let seq1_id = h
+        .state()
+        .versions
+        .iter()
+        .find(|v| v.seq == 1)
+        .map(|v| v.id)
+        .unwrap_or_else(|| panic!("seq 1 not in the loaded versions"));
+    h.state_mut().selected_version = Some(seq1_id);
+    h.run();
+    h.query_all(By::new().label_contains("Set label"))
+        .next()
+        .unwrap_or_else(|| panic!("`Set label` button not found"))
+        .click();
+    h.run();
+    h.state_mut().label_draft = "before deploy".into();
+    h.query_all(By::new().label("OK"))
+        .next()
+        .unwrap_or_else(|| panic!("modal `OK` button not found"))
+        .click();
+    h.run();
+    h.run();
+    assert_eq!(visible_rows(&h), 3, "unfiltered after labeling: all rows still visible");
+
+    h.state_mut().label_filter = "deploy".into();
+    h.run();
+    h.run();
+    assert_eq!(visible_rows(&h), 1, "label filter keeps only seq 1");
+    h.state_mut().label_filter = "nomatch-anywhere".into();
+    h.run();
+    assert_eq!(visible_rows(&h), 0, "a label that matches nothing hides every row");
+}
+
+/// Vietnamese locale: the pinned gui-state.json switches every chrome label
+/// (tabs "Tệp" / "Hoạt động") — the same App, no recompilation.
+#[test]
+fn vi_locale_translates_the_chrome() {
+    let _locale = locale_guard();
+    let s = seed_versions(3);
+    let mut h = make_harness_lang(&s, None, "vi");
+    h.run();
+
+    assert!(h.query_all(By::new().label("Tệp")).count() >= 1, "tab Files in Vietnamese");
+    assert!(
+        h.query_all(By::new().label("Hoạt động")).count() >= 1,
+        "tab Activity in Vietnamese"
+    );
+    // the English labels must be gone from the tab strip
+    assert_eq!(h.query_all(By::new().label("Files")).count(), 0);
 }

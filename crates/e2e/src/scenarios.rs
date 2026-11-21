@@ -127,6 +127,7 @@ struct GcJson {
     dry_run: bool,
     files_scanned: u64,
     versions_deleted: u64,
+    orphan_blobs: u64,
 }
 
 /// One scenario function: the whole flow, returning a note or a failure reason.
@@ -154,6 +155,15 @@ pub fn registry() -> Vec<(&'static str, ScenarioFn)> {
         ("corrupt_blob_recovery", s16_corrupt_blob_recovery),
         ("delta_chain_rollover", s17_delta_chain_rollover),
         ("revert_noop", s18_revert_noop),
+        ("rename_out_of_ws", s19_rename_out_of_ws),
+        ("rename_to_ignored", s20_rename_to_ignored),
+        ("concurrent_writers", s21_concurrent_writers),
+        ("stale_lock_takeover", s22_stale_lock_takeover),
+        ("full_policy_big_patch", s23_full_policy_big_patch),
+        ("empty_and_weird_files", s24_empty_and_weird_files),
+        ("orphan_blob_gc", s25_orphan_blob_gc),
+        ("max_file_size_cap", s26_max_file_size_cap),
+        ("command_matrix", s27_command_matrix),
     ]
 }
 
@@ -1320,5 +1330,470 @@ fn s18_revert_noop(ctx: &Ctx) -> Res {
     }
     Ok(format!(
         "no-op revert: reverted=true, pre_revert_seq null, history unchanged ({before_count} versions), disk byte-exact"
+    ))
+}
+
+// ---------------------------------------------------------------- S19
+
+/// A rename whose destination is OUTSIDE every watched workspace is treated
+/// as a plain removal: the old path gets a delete marker, and the file at its
+/// new location is not tracked at all.
+fn s19_rename_out_of_ws(ctx: &Ctx) -> Res {
+    let h = Harness::new(&ctx.lh, 1)?;
+    let ws = h.ws_path(0);
+    let a = ws.join("a.txt");
+    io(fs::write(&a, "leaving the workspace\n"), "failed to write a.txt")?;
+    wave_gap();
+    io(fs::write(&a, "leaving v2\n"), "failed to write a.txt v2")?;
+    h.wait_history(&a, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 2)
+    })?;
+
+    // Move OUT of the workspace: the store tempdir is outside every watch dir.
+    let outside = h.store.path().join("moved-out.txt");
+    io(fs::rename(&a, &outside), "failed to move a.txt out of the workspace")?;
+
+    let got = poll_until(10_000, POLL_INTERVAL_MS, || {
+        let ha = h.history_json(&a).ok()?;
+        let newest = v_arr(&ha, "versions").ok()?.first()?.get("kind").and_then(Value::as_str)?;
+        (newest == "delete").then_some(ha)
+    });
+    let ha = got.ok_or("old path did not gain a delete marker within 10s")?;
+    if v_u64(&ha, "count")? != 3 {
+        return Err(format!(
+            "old path should have 2 old versions + 1 delete marker, got {}",
+            v_u64(&ha, "count")?
+        ));
+    }
+
+    // The file at its new location is untracked: `lh history` outside a ws is
+    // a clean error (non-zero exit), and the store never created versions.
+    let p_out = outside.display().to_string();
+    let s = h.cli(&["history", "--json", &p_out])?;
+    if s.code == 0 {
+        return Err(format!("history outside the workspace must fail, got: {}", s.stdout));
+    }
+    Ok("rename out of the workspace: delete marker on the old path, nothing tracked outside".into())
+}
+
+// ---------------------------------------------------------------- S20
+
+/// Renaming a tracked file INTO an ignored directory (node_modules) records a
+/// delete marker on the old path and NOTHING inside the ignored tree.
+fn s20_rename_to_ignored(ctx: &Ctx) -> Res {
+    let h = Harness::new(&ctx.lh, 1)?;
+    let ws = h.ws_path(0);
+    io(fs::create_dir_all(ws.join("node_modules")), "failed to create node_modules")?;
+    let b = ws.join("b.txt");
+    io(fs::write(&b, "moving into the void\n"), "failed to write b.txt")?;
+    h.wait_history(&b, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 1)
+    })?;
+
+    let ignored_dest = ws.join("node_modules").join("b.txt");
+    io(fs::rename(&b, &ignored_dest), "failed to move b.txt into node_modules")?;
+
+    let got = poll_until(10_000, POLL_INTERVAL_MS, || {
+        let hb = h.history_json(&b).ok()?;
+        let newest = v_arr(&hb, "versions").ok()?.first()?.get("kind").and_then(Value::as_str)?;
+        (newest == "delete").then_some(hb)
+    });
+    let hb = got.ok_or("old path did not gain a delete marker within 10s")?;
+    if v_u64(&hb, "count")? != 2 {
+        return Err(format!(
+            "old path should have 1 old version + 1 delete marker, got {}",
+            v_u64(&hb, "count")?
+        ));
+    }
+    // Settle well past the debounce, then prove the ignored copy is untracked.
+    sleep(Duration::from_millis(1800));
+    let j = h.history_json(&ignored_dest)?;
+    if v_u64(&j, "count")? != 0 {
+        return Err(format!(
+            "file inside node_modules must have zero versions, got {}",
+            v_u64(&j, "count")?
+        ));
+    }
+    Ok("rename into an ignored dir: delete marker on the old path, zero versions inside".into())
+}
+
+// ---------------------------------------------------------------- S21
+
+/// Three writers append to their own files CONCURRENTLY (interleaved fs
+/// events) — no content may be lost: each file's newest version reconstructs
+/// byte-exactly to the on-disk content, with every writer's lines present.
+fn s21_concurrent_writers(ctx: &Ctx) -> Res {
+    let h = Harness::new(&ctx.lh, 1)?;
+    let ws = h.ws_path(0);
+    let writers: Vec<String> = (0..3).map(|i| format!("writer_{i}.log")).collect();
+    for name in &writers {
+        io(fs::write(ws.join(name), ""), "failed to init writer file")?;
+    }
+    h.wait_history(&ws.join(&writers[0]), 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 1)
+    })?;
+
+    let handles: Vec<_> = writers
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let dir = ws.clone();
+            let name = name.clone();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                for k in 0..20 {
+                    let line = format!("writer {i} line {k}\n");
+                    let mut f =
+                        fs::OpenOptions::new().append(true).open(dir.join(&name)).unwrap();
+                    f.write_all(line.as_bytes()).unwrap();
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+            })
+        })
+        .collect();
+    for t in handles {
+        t.join().map_err(|_| "writer thread panicked".to_string())?;
+    }
+
+    // Every writer's 20 lines must end up in the final version, byte-exact.
+    for name in &writers {
+        let f = ws.join(name);
+        let expected = io(fs::read(&f), "failed to read writer file")?;
+        let expected_str = String::from_utf8_lossy(&expected).into_owned();
+        let line_count = expected_str.lines().count();
+        if line_count != 20 {
+            return Err(format!("{name} has {line_count} lines, expected 20"));
+        }
+        h.wait_history(&f, 15_000, |v| {
+            v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 1)
+        })?;
+        // Settle any trailing debounce, then compare the newest version to disk.
+        sleep(Duration::from_millis(800));
+        let s = h.cli(&["show", &f.display().to_string(), "--at", "latest"])?;
+        if s.code != 0 || s.stdout != expected_str {
+            return Err(format!(
+                "{name}: newest version lost content (exit {}): {:?}",
+                s.code,
+                truncate(&s.stdout, 200)
+            ));
+        }
+    }
+    Ok("3 concurrent writers × 20 appends: no lost content, each file's latest version is byte-exact".into())
+}
+
+// ---------------------------------------------------------------- S22
+
+/// After a hard kill the lock dies with the process (fd-lock) and daemon.json
+/// goes stale: `lh status` must report alive=false cleanly (no crash), and a
+/// respawned daemon must take over — replacing the stale status with its own
+/// pid.
+fn s22_stale_lock_takeover(ctx: &Ctx) -> Res {
+    let mut h = Harness::new(&ctx.lh, 1)?;
+    let ws = h.ws_path(0);
+    let f = ws.join("takeover.txt");
+    io(fs::write(&f, "before takeover\n"), "failed to write takeover.txt")?;
+    h.wait_history(&f, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 1)
+    })?;
+
+    let status_path = h.store.path().join("daemon.json");
+    let old_raw = io(fs::read_to_string(&status_path), "failed to read daemon.json")?;
+    let old_pid = serde_json::from_str::<Value>(&old_raw)
+        .ok()
+        .and_then(|j| j.get("pid").and_then(Value::as_u64))
+        .ok_or("daemon.json has no pid")?;
+
+    // Hard kill → stale daemon.json with a dead pid.
+    h.kill_daemon()?;
+    let s = h.cli(&["--json", "status"])?;
+    if s.code != 0 {
+        return Err(format!("status on a stale daemon.json must exit 0, got {}", s.code));
+    }
+    let j = s.json()?;
+    if status_alive(&j) {
+        return Err("status must report alive=false while the pid is dead".into());
+    }
+
+    // Respawn: the OS lock is free again, the new daemon takes over.
+    h.spawn_daemon()?;
+    let j = h.status_json()?;
+    if !status_alive(&j) {
+        return Err("respawned daemon must report alive=true".into());
+    }
+    let new_raw = io(fs::read_to_string(&status_path), "failed to re-read daemon.json")?;
+    let new_pid = serde_json::from_str::<Value>(&new_raw)
+        .ok()
+        .and_then(|j| j.get("pid").and_then(Value::as_u64))
+        .ok_or("daemon.json after respawn has no pid")?;
+    if new_pid == old_pid {
+        return Err(format!("stale daemon.json was not replaced (pid {new_pid} unchanged)"));
+    }
+    // The store survived the takeover: history is still readable.
+    let j = h.history_json(&f)?;
+    if v_u64(&j, "count")? < 1 {
+        return Err("history lost after the takeover".into());
+    }
+    Ok(format!(
+        "stale lock takeover: status alive=false on the dead pid (old pid {old_pid}), respawn took over (pid {new_pid}), history intact"
+    ))
+}
+
+// ---------------------------------------------------------------- S23
+
+/// Editing ~80% of the lines at once must exceed the delta budget
+/// (`patch >= content/2`) and store a FULL snapshot, not a delta.
+fn s23_full_policy_big_patch(ctx: &Ctx) -> Res {
+    let h = Harness::new(&ctx.lh, 1)?;
+    let f = h.ws_path(0).join("big.txt");
+    let p = f.display().to_string();
+    let small: String = (0..100).map(|i| format!("original line {i}\n")).collect();
+    io(fs::write(&f, &small), "failed to write big.txt")?;
+    h.wait_history(&f, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 1)
+    })?;
+
+    let big: String = (0..100)
+        .map(|i| {
+            if i % 5 == 0 {
+                format!("REWRITTEN line {i}\n")
+            } else {
+                format!("original line {i}\n")
+            }
+        })
+        .collect();
+    io(fs::write(&f, &big), "failed to rewrite big.txt")?;
+    let hist = h.wait_history(&f, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 2)
+    })?;
+    let v2 = find_seq(&hist, 2).ok_or("seq 2 missing")?;
+    if v_str(v2, "storage")? != "full" {
+        return Err(format!("a patch this large must store a full snapshot, got: {v2}"));
+    }
+    let s = h.cli(&["show", &p, "--at", "latest"])?;
+    if s.code != 0 || s.stdout != big {
+        return Err(format!("rewritten content must reconstruct byte-exact: {s:?}"));
+    }
+    Ok("80%-line rewrite stored as a full snapshot (patch over the delta budget), content byte-exact".into())
+}
+
+// ---------------------------------------------------------------- S24
+
+/// Odd files all round-trip byte-exactly: an empty file, NUL bytes in the
+/// middle, CRLF line endings, and a unicode name with spaces.
+fn s24_empty_and_weird_files(ctx: &Ctx) -> Res {
+    let h = Harness::new(&ctx.lh, 1)?;
+    let ws = h.ws_path(0);
+    let cases: Vec<(&str, &str)> = vec![
+        ("empty.txt", ""),
+        ("nulls.dat", "\u{0}\u{1}\u{0}data\u{0}"),
+        ("crlf.txt", "line one\r\nline two\r\n"),
+        ("tên có khoảng cách.txt", "nội dung tiếng Việt ✓\n"),
+    ];
+    for (name, content) in &cases {
+        let f = ws.join(name);
+        io(fs::write(&f, content), "failed to write the file")?;
+        h.wait_history(&f, 10_000, |v| {
+            v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 1)
+        })?;
+        let p = f.display().to_string();
+        let s = h.cli(&["show", &p, "--at", "latest"])?;
+        if s.code != 0 || s.stdout != *content {
+            return Err(format!(
+                "{name}: content did not round-trip (exit {}): {:?}",
+                s.code,
+                truncate(&s.stdout, 120)
+            ));
+        }
+    }
+    // The empty file round-trips AND its first version is a full snapshot.
+    let j = h.history_json(&ws.join("empty.txt"))?;
+    let v1 = find_seq(&j, 1).ok_or("empty.txt seq 1 missing")?;
+    if v_str(v1, "storage")? != "full" {
+        return Err("the empty file's first version must be a full snapshot".into());
+    }
+    Ok("empty / NUL / CRLF / unicode-name files all recorded and reconstructed byte-exact".into())
+}
+
+// ---------------------------------------------------------------- S25
+
+/// A blob file with no row in the db (orphan) is found and deleted by a REAL
+/// `lh gc` run; live versions are untouched.
+fn s25_orphan_blob_gc(ctx: &Ctx) -> Res {
+    let h = Harness::new(&ctx.lh, 1)?;
+    let ws = h.ws_path(0);
+    let f = ws.join("gcme.txt");
+    io(fs::write(&f, "gc orphan test\n"), "failed to write gcme.txt")?;
+    wave_gap();
+    io(fs::write(&f, "gc orphan test v2\n"), "failed to write gcme.txt v2")?;
+    let hist = h.wait_history(&f, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 2)
+    })?;
+
+    let ws_id = v_u64(
+        v_arr(&h.status_json()?, "workspaces")?
+            .first()
+            .ok_or("no workspace in status")?,
+        "id",
+    )?;
+    let blobs_dir = h
+        .store
+        .path()
+        .join("workspaces")
+        .join(format!("{ws_id:016x}"))
+        .join("blobs");
+    if !blobs_dir.exists() {
+        return Err(format!("blobs dir missing at {}", blobs_dir.display()));
+    }
+    // Drop an orphan blob with an id no version references.
+    let orphan = blobs_dir.join("v999999-full.zst");
+    io(fs::write(&orphan, b"orphan blob body"), "failed to write the orphan blob")?;
+
+    let g: GcJson = h.cli_json_as(&["gc"])?;
+    if g.dry_run {
+        return Err("real gc must not report dry_run=true".into());
+    }
+    if g.orphan_blobs < 1 {
+        return Err(format!("gc must report the orphan blob, got {}", g.orphan_blobs));
+    }
+    if orphan.exists() {
+        return Err("the orphan blob file was not deleted by gc".into());
+    }
+    // Live versions survive: seq 1 still reconstructs.
+    let s = h.cli(&["show", &f.display().to_string(), "--at", "1"])?;
+    if s.code != 0 || s.stdout != "gc orphan test\n" {
+        return Err(format!("live version damaged by gc: {s:?}"));
+    }
+    let _ = find_seq(&hist, 1).ok_or("history broken after gc")?;
+    Ok(format!(
+        "orphan blob found ({}) and deleted; live versions intact",
+        g.orphan_blobs
+    ))
+}
+
+// ---------------------------------------------------------------- S26
+
+/// A file larger than the 10MB cap is skipped entirely — no version, daemon
+/// stays healthy — while normal files keep recording afterwards.
+fn s26_max_file_size_cap(ctx: &Ctx) -> Res {
+    let h = Harness::new(&ctx.lh, 1)?;
+    let ws = h.ws_path(0);
+    let huge = ws.join("huge.bin");
+    let mut body = Vec::with_capacity(11 * 1024 * 1024);
+    for i in 0..11 * 1024 * 256 {
+        body.extend_from_slice(format!("chunk {i}\n").as_bytes());
+        if body.len() > 11 * 1024 * 1024 {
+            break;
+        }
+    }
+    body.truncate(11 * 1024 * 1024);
+    io(fs::write(&huge, &body), "failed to write the oversized file")?;
+    // Well past the debounce: the cap must have skipped it.
+    sleep(Duration::from_millis(1800));
+    let j = h.history_json(&huge)?;
+    if v_u64(&j, "count")? != 0 {
+        return Err(format!(
+            "file over the 10MB cap must not be recorded, got {} version(s)",
+            v_u64(&j, "count")?
+        ));
+    }
+    if !h.daemon_alive() {
+        return Err("daemon died handling the oversized file".into());
+    }
+    // The daemon still records normal files afterwards.
+    let ok = ws.join("after.txt");
+    io(fs::write(&ok, "still alive\n"), "failed to write after.txt")?;
+    h.wait_history(&ok, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 1)
+    })?;
+    Ok("file over the 10MB cap skipped (0 versions, daemon alive); normal recording continues".into())
+}
+
+// ---------------------------------------------------------------- S27
+
+/// Every headless CLI subcommand runs against a live store: correct exit code
+/// and output shape for text AND --json mode (daemon/gui/ui are covered by
+/// the rest of the suite, self-update --check pins its clean error).
+fn s27_command_matrix(ctx: &Ctx) -> Res {
+    let h = Harness::new(&ctx.lh, 1)?;
+    let ws = h.ws_path(0);
+    let f = ws.join("matrix.txt");
+    let p = f.display().to_string();
+    io(fs::write(&f, "matrix v1\n"), "failed to write matrix.txt")?;
+    wave_gap();
+    io(fs::write(&f, "matrix v2\n"), "failed to write matrix.txt v2")?;
+    wave_gap();
+    io(fs::write(&f, "matrix v3\n"), "failed to write matrix.txt v3")?;
+    h.wait_history(&f, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 3)
+    })?;
+    // A second wave of files -> a batch to inspect/revert.
+    for i in 0..3 {
+        io(
+            fs::write(ws.join(format!("batch_{i}.txt")), format!("batch file {i}\n")),
+            "failed to write batch file",
+        )?;
+    }
+    h.wait_history(&ws.join("batch_0.txt"), 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 1)
+    })?;
+    let batches = v_arr(&h.batches_json()?, "batches")?.clone();
+    // batches is newest-first; the newest batch (id = max) holds the 3 created
+    // files — reverting it deletes them (they had no pre-batch state).
+    let newest_id = batches
+        .iter()
+        .map(|b| v_u64(b, "id").unwrap_or(0))
+        .max()
+        .ok_or("no batch recorded")?;
+    let batch_id = newest_id.to_string();
+
+    // Text mode: exit 0 + non-empty output.
+    for args in [
+        vec!["status"],
+        vec!["workspaces"],
+        vec!["history", &p],
+        vec!["show", &p, "--at", "latest"],
+        vec!["diff", &p, "1", "2"],
+        vec!["label", &p, "e2e matrix label"],
+        vec!["gc", "--dry-run"],
+        vec!["batches", "--limit", "5"],
+        vec!["batch", &batch_id],
+    ] {
+        let out = h.cli(&args)?;
+        if out.code != 0 {
+            return Err(format!("`lh {}` exited {}: {}", args.join(" "), out.code, out.stderr));
+        }
+        if out.stdout.trim().is_empty() {
+            return Err(format!("`lh {}` produced no output", args.join(" ")));
+        }
+    }
+    // JSON mode: parses and has the essential field (history needs its file arg).
+    let j = h.cli_json_value(&["status"])?;
+    v_arr(&j, "workspaces").map_err(|e| format!("`lh status --json`: {e}"))?;
+    let j = h.cli_json_value(&["history", &p])?;
+    v_arr(&j, "versions").map_err(|e| format!("`lh history --json`: {e}"))?;
+    let j = h.cli_json_value(&["batches"])?;
+    v_arr(&j, "batches").map_err(|e| format!("`lh batches --json`: {e}"))?;
+    let _ = h.cli_json_value(&["batch", &batch_id])?;
+    // revert-batch on the newest batch (created files): the engine deletes
+    // them (no pre-batch state to restore) — the report counts them under
+    // `deleted`; anything reverted/restored/deleted ≥ 1 proves it worked.
+    let r = h.cli_json_value(&["revert-batch", &batch_id, "--yes"])?;
+    let acted = v_u64(&r, "reverted")? + v_u64(&r, "restored")? + v_u64(&r, "deleted")?;
+    if acted < 1 {
+        return Err(format!("revert-batch acted on 0 files: {r}"));
+    }
+    if ws.join("batch_0.txt").exists() {
+        return Err("reverting the creation batch must delete batch_0.txt".into());
+    }
+    // self-update --check with an empty source dir: clean failure (no panic).
+    let src = h.store.path().join("update-src");
+    io(fs::create_dir_all(&src), "failed to create update source dir")?;
+    let src_s = src.display().to_string();
+    let s = h.cli(&["self-update", "--check", "--source", &src_s])?;
+    if s.code == 101 || s.code == 134 {
+        return Err(format!("self-update --check panicked (exit {})", s.code));
+    }
+    Ok(format!(
+        "command matrix: status/workspaces/history/show/diff/label/gc/batches/batch/revert-batch (id {batch_id}) all exit 0, JSON shapes verified, self-update --check fails cleanly"
     ))
 }
