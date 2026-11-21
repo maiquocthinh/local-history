@@ -75,6 +75,7 @@ diff:
   file_missing: "File is no longer on disk (deleted?)."
   copy: "Copy diff (patch)"
   copied: "%{n} segment(s) copied"
+  collapsed: "%{n} unchanged lines hidden"
   copied_pane: "%{n} line(s) copied"
   copied_diff: "Unified diff copied to the clipboard"
   menu_copy_selection: "Copy selection"

@@ -1768,6 +1768,7 @@ impl App {
                             del: false,
                             add: false,
                             cont: false,
+                            collapsed: None,
                         })
                         .collect();
                     return DiffModel {

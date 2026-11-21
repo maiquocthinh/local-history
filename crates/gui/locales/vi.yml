@@ -76,6 +76,7 @@ diff:
   copy: "Sao chép diff (patch)"
   copied: "đã copy %{n} đoạn"
   copied_pane: "đã copy %{n} dòng"
+  collapsed: "— ẩn %{n} dòng không đổi —"
   copied_diff: "Đã copy unified diff vào clipboard"
   menu_copy_selection: "Sao chép vùng chọn"
   menu_copy_left: "Sao chép bên trái"

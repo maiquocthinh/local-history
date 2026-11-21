@@ -32,6 +32,7 @@ fn num_font() -> egui::FontId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Line {
     /// Line content verbatim, including the terminator (stripped when rendering).
+    /// Collapsed-marker rows keep this empty (the painter shows the marker).
     pub text: String,
     /// 1-based line number within the pane's content; `None` for filler rows
     /// that pad a length mismatch between the two sides (and for wrap
@@ -44,21 +45,63 @@ pub struct Line {
     /// Soft-wrap continuation segment: joins the previous row's logical line
     /// when copying (no inserted newline between the two segments).
     pub cont: bool,
+    /// Context-collapse marker: this row stands in for `n` unchanged lines
+    /// (VS Code diff style — a one-line change in a big file stays short).
+    pub collapsed: Option<usize>,
 }
 
 impl Line {
     fn context(text: &str, no: usize) -> Self {
-        Line { text: text.to_string(), no: Some(no), del: false, add: false, cont: false }
+        Line {
+            text: text.to_string(),
+            no: Some(no),
+            del: false,
+            add: false,
+            cont: false,
+            collapsed: None,
+        }
     }
     fn del(text: &str, no: usize) -> Self {
-        Line { text: text.to_string(), no: Some(no), del: true, add: false, cont: false }
+        Line {
+            text: text.to_string(),
+            no: Some(no),
+            del: true,
+            add: false,
+            cont: false,
+            collapsed: None,
+        }
     }
     fn add(text: &str, no: usize) -> Self {
-        Line { text: text.to_string(), no: Some(no), del: false, add: true, cont: false }
+        Line {
+            text: text.to_string(),
+            no: Some(no),
+            del: false,
+            add: true,
+            cont: false,
+            collapsed: None,
+        }
     }
     /// Filler row padding a length mismatch — neutral, never colored.
     fn filler() -> Self {
-        Line { text: String::new(), no: None, del: false, add: false, cont: false }
+        Line {
+            text: String::new(),
+            no: None,
+            del: false,
+            add: false,
+            cont: false,
+            collapsed: None,
+        }
+    }
+    /// Context-collapse marker standing in for `n` unchanged rows.
+    fn collapsed(n: usize) -> Self {
+        Line {
+            text: String::new(),
+            no: None,
+            del: false,
+            add: false,
+            cont: false,
+            collapsed: Some(n),
+        }
     }
 }
 
@@ -177,7 +220,60 @@ impl DiffModel {
     /// Finishes a freshly built model by computing `max_chars`.
     pub fn finished(mut self) -> Self {
         self.compute_max_chars();
+        self.collapse_context();
         self
+    }
+
+    /// Context collapse (VS Code diff style): unchanged rows farther than
+    /// [`CTX`] lines from any changed row fold into single marker rows — a
+    /// one-line change in a big file renders a short diff, not the whole file.
+    /// Both panes fold in lockstep so the grid stays row-aligned.
+    fn collapse_context(&mut self) {
+        const CTX: usize = 3;
+        const MIN_HIDE: usize = 4; // collapse only when ≥4 rows fold away
+        let total = self.left.len().max(self.right.len());
+        let changed = |r: usize| -> bool {
+            let is_ch = |l: Option<&Line>| l.map(|x| x.del || x.add).unwrap_or(false);
+            is_ch(self.left.get(r)) || is_ch(self.right.get(r))
+        };
+        // pass 1: mark the foldable middle of every long unchanged run
+        let mut fold = vec![false; total];
+        let mut r = 0usize;
+        while r < total {
+            if changed(r) {
+                r += 1;
+                continue;
+            }
+            let start = r;
+            while r < total && !changed(r) {
+                r += 1;
+            }
+            let run = r - start; // unchanged rows [start, r)
+            if run > CTX * 2 + MIN_HIDE {
+                fold[(start + CTX)..(r - CTX)].fill(true);
+            }
+        }
+        // pass 2: rebuild both panes, one marker row per contiguous fold
+        let mut newl = Vec::new();
+        let mut newr = Vec::new();
+        let mut s = 0usize;
+        while s < total {
+            if !fold[s] {
+                newl.push(self.left.get(s).cloned().unwrap_or_else(Line::filler));
+                newr.push(self.right.get(s).cloned().unwrap_or_else(Line::filler));
+                s += 1;
+            } else {
+                let start = s;
+                while s < total && fold[s] {
+                    s += 1;
+                }
+                let n = Line::collapsed(s - start);
+                newl.push(n.clone());
+                newr.push(n);
+            }
+        }
+        self.left = newl;
+        self.right = newr;
     }
 }
 
@@ -239,6 +335,7 @@ pub fn wrap_lines(lines: &[Line], cols: usize) -> Vec<Line> {
                 del: l.del,
                 add: l.add,
                 cont: idx > 0,
+                collapsed: None,
             };
             if idx == chunks - 1 && l.text.ends_with('\n') {
                 seg.text.push('\n'); // keep the terminator on the last segment
@@ -478,6 +575,9 @@ fn selection_segments(model: &DiffModel, from: CaretPos, to: CaretPos) -> Vec<St
                 Pane::Right => &model.right,
             };
             let Some(line) = lines.get(row) else { continue };
+            if line.collapsed.is_some() {
+                continue; // marker rows never contribute text to a copy
+            }
             let Some((c0, c1)) = cell_selected_cols(from, to, row, pane, line_chars(line)) else {
                 continue;
             };
@@ -879,6 +979,12 @@ fn draw_cell(
     let Some(l) = line else { return resp };
     let p = ui.painter_at(rect);
     let y = rect.center().y;
+    if let Some(n) = l.collapsed {
+        // context-collapse marker: dim centered "N unchanged lines hidden"
+        let label = t!("diff.collapsed", n = n).to_string();
+        p.text(egui::pos2(rect.center().x, y), egui::Align2::CENTER_CENTER, label, diff_font(), NUM_COLOR);
+        return resp;
+    }
     if let Some(no) = l.no {
         p.text(
             egui::pos2(rect.left() + GUTTER - 8.0, y),
@@ -1334,5 +1440,67 @@ mod tests {
         // a partial selection spanning the wrap boundary joins too
         let sel = sel_from_to(caret(1, Pane::Left, 1), caret(2, Pane::Left, 1));
         assert_eq!(selection_text(&m, &sel), "fghi");
+    }
+
+    // ----- context collapse: unchanged middles fold into marker rows -----
+
+    /// 61 rows: 30 context + 1 changed (row 30, right side add) + 30 context.
+    fn long_model() -> DiffModel {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for i in 1..=61usize {
+            left.push(Line::context(&format!("old {i}\n"), i));
+            if i == 31 {
+                right.push(Line::add("new 31\n", 31));
+            } else {
+                right.push(Line::context(&format!("old {i}\n"), i));
+            }
+        }
+        DiffModel {
+            left_title: "left".into(),
+            right_title: "right".into(),
+            left,
+            right,
+            binary: false,
+            note: None,
+            identical: false,
+            max_chars: 8,
+        }
+    }
+
+    #[test]
+    fn collapse_context_folds_long_unchanged_runs() {
+        let mut m = long_model();
+        m.compute_max_chars();
+        m.collapse_context();
+        // per run: 3 kept + 1 marker + 3 kept = 7 rows ⇒ 7 + 1 changed + 7
+        assert_eq!(m.left.len(), m.right.len());
+        assert_eq!(m.left.len(), 15);
+        assert_eq!(m.left[0].no, Some(1)); // head context kept from the run start
+        assert_eq!(m.left[3].collapsed, Some(24), "30-run folds 30-6 rows");
+        assert_eq!(m.left[6].no, Some(30)); // tail context before the change
+        assert!(m.right[7].add, "the changed row survives at index 7");
+        assert_eq!(m.left[11].collapsed, Some(24));
+        assert_eq!(m.left[12].no, Some(59)); // tail context of the second run
+    }
+
+    #[test]
+    fn short_runs_are_never_collapsed() {
+        let mut m = test_model(); // 3 rows — far below the fold threshold
+        m.compute_max_chars();
+        m.collapse_context();
+        assert_eq!(m.left.len(), 3);
+        assert!(m.left.iter().chain(m.right.iter()).all(|l| l.collapsed.is_none()));
+    }
+
+    #[test]
+    fn selection_skips_collapsed_marker_rows() {
+        let mut m = long_model();
+        m.compute_max_chars();
+        m.collapse_context();
+        let sel = sel_from_to(caret(0, Pane::Left, 0), caret(m.left.len() - 1, Pane::Left, 0));
+        let text = selection_text(&m, &sel);
+        assert!(text.lines().count() >= 6, "kept context + changed rows copy");
+        assert!(!text.contains("unchanged"), "markers never contribute text");
     }
 }
