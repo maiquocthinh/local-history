@@ -331,3 +331,90 @@ fn drag_selection_stays_in_one_pane() {
     assert_eq!(from.pane, to.pane, "selection must never span both panes");
     assert_eq!(from.pane, gui::diff_view::Pane::Left, "drag started in the left pane");
 }
+
+/// Seeded rename: `notes.txt` gets 2 external versions, then the file is
+/// renamed on disk to `note-final.txt` and `engine.rename` moves the chain.
+fn seed_rename() -> Seed {
+    let store = TempDir::new().unwrap();
+    let ws = TempDir::new().unwrap();
+    let (lh, ws_id) = open_seeded(&store, &ws, false);
+    let notes = ws.path().join("notes.txt");
+    for i in 1..=2 {
+        let content = format!("line v{i}\n");
+        std::fs::write(&notes, &content).unwrap();
+        lh.record(ws_id, &notes, content.as_bytes(), EventKind::External, None).unwrap();
+    }
+    let final_p = ws.path().join("note-final.txt");
+    std::fs::rename(&notes, &final_p).unwrap();
+    lh.rename(ws_id, &notes, &final_p).unwrap().expect("seed rename must record");
+    let store_root = store.path().to_path_buf();
+    Seed { _store: store, _ws: ws, store_root, notes: final_p }
+}
+
+/// Rename version: the timeline row (its a11y label is the row tooltip)
+/// carries the `rename` kind AND the `renamed from <old path>` line; the
+/// diff heading names the same version (`seq N · rename`).
+#[test]
+fn rename_row_shows_kind_and_old_path() {
+    let s = seed_rename();
+    let mut h = make_harness(&s, Some(&s.notes));
+    h.run();
+    select_notes(&mut h, &s);
+    h.run();
+
+    // timeline row label = "seq 3 · rename · hash …\nrenamed from notes.txt"
+    assert!(
+        h.query_all(By::new().label_contains("renamed from notes.txt")).count() >= 1,
+        "the rename row must carry the old path in its tooltip/label"
+    );
+    assert!(
+        h.query_all(By::new().label_contains("· rename ·")).count() >= 1,
+        "the rename row must show the rename kind"
+    );
+    // the diff pane heading names the selected (newest) version as rename
+    assert!(
+        h.query_all(By::new().role(egui::accesskit::Role::Label))
+            .filter(|n| n.value().is_some_and(|v| v.contains("· rename ·")))
+            .count()
+            >= 1,
+        "the diff heading must name the rename version"
+    );
+}
+
+/// Revert from the GUI: select seq 1 in the timeline, click
+/// "Revert to this version", confirm in the modal ("Revert" button) — the
+/// file on disk goes back to v1 byte-exact.
+#[test]
+fn revert_from_gui_restores_disk_content() {
+    let s = seed_versions(3);
+    let mut h = make_harness(&s, Some(&s.notes));
+    h.run();
+    select_notes(&mut h, &s);
+    h.run();
+
+    // click the timeline row of seq 1 (role Unknown rows carry the tooltip as
+    // their label; the file-list row and pane headings have different roles)
+    let row = h
+        .query_all(By::new().label_contains("seq 1"))
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::Unknown)
+        .unwrap_or_else(|| panic!("timeline row `seq 1` not found in the tree"));
+    row.click();
+    h.run();
+
+    h.get_by_label_contains("Revert to this version").click();
+    h.run();
+    // the confirm modal's action button is exactly "Revert" (btn.do_revert)
+    let confirm = h
+        .query_all(By::new().label("Revert"))
+        .next()
+        .unwrap_or_else(|| panic!("confirm modal `Revert` button not found"));
+    confirm.click();
+    h.run();
+
+    let disk = std::fs::read(&s.notes).unwrap();
+    assert_eq!(
+        disk,
+        b"line v1\nsecond line 1\n".to_vec(),
+        "GUI revert must restore seq 1's content on disk"
+    );
+}

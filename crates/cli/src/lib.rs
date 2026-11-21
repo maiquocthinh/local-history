@@ -689,12 +689,16 @@ fn cmd_revert(cli: &Cli, file: &Path, at: &str, yes: bool) -> Result<()> {
         }
     }
 
+    let history_before = store.history(ws, file)?.len();
     store.revert(ws, file, v.id)?;
-    // After revert: the newest PreRevert version (recorded when disk differed from the
-    // target) is the safety snapshot the restore sits on. Disk already matched → the
-    // engine writes nothing.
+    // After revert: when disk differed from the target the engine recorded pre_revert
+    // (+ restore) — the newest PreRevert version is the safety snapshot the restore
+    // sits on. Disk already matched → the engine wrote nothing → report no snapshot
+    // (a pre_revert from an EARLIER revert must not leak into this report).
     let after = store.history(ws, file)?;
-    let pre = after.iter().find(|x| x.kind == EventKind::PreRevert);
+    let pre = (after.len() > history_before)
+        .then(|| after.iter().find(|x| x.kind == EventKind::PreRevert))
+        .flatten();
     if cli.json {
         println!(
             "{}",

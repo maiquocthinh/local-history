@@ -148,6 +148,12 @@ pub fn registry() -> Vec<(&'static str, ScenarioFn)> {
         ("daemon_resilience", s10_daemon_resilience),
         ("gc_dry_run", s11_gc_dry_run),
         ("ignored_dirs", s12_ignored_dirs),
+        ("rename_collision_fallback", s13_rename_collision_fallback),
+        ("debounce_coalesce", s14_debounce_coalesce),
+        ("kill_mid_record", s15_kill_mid_record),
+        ("corrupt_blob_recovery", s16_corrupt_blob_recovery),
+        ("delta_chain_rollover", s17_delta_chain_rollover),
+        ("revert_noop", s18_revert_noop),
     ]
 }
 
@@ -983,4 +989,336 @@ fn s12_ignored_dirs(ctx: &Ctx) -> Res {
         }
     }
     Ok("tracked.txt recorded; .git/HEAD and node_modules/x.js have zero versions".into())
+}
+
+// ---------------------------------------------------------------- S13
+
+/// Renaming a file ONTO a tracked path (both have history) must NOT merge the
+/// chains: the engine refuses the collision, so the daemon's fallback records
+/// a delete marker on the old path and new content on the destination — two
+/// separate chains, nothing lost.
+fn s13_rename_collision_fallback(ctx: &Ctx) -> Res {
+    let h = Harness::new(&ctx.lh, 1)?;
+    let ws = h.ws_path(0);
+    let a = ws.join("a.txt");
+    let c = ws.join("c.txt");
+    io(fs::write(&a, "a content v1\n"), "failed to write a.txt")?;
+    wave_gap();
+    io(fs::write(&a, "a content v2\n"), "failed to write a.txt v2")?;
+    io(fs::write(&c, "c own history\n"), "failed to write c.txt")?;
+    h.wait_history(&a, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|k| k >= 2)
+    })?;
+    h.wait_history(&c, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|k| k >= 1)
+    })?;
+
+    io(fs::rename(&a, &c), "failed to rename a.txt over c.txt")?;
+    // Old path gains a delete marker; destination gains the new content.
+    let got = poll_until(10_000, POLL_INTERVAL_MS, || {
+        let ha = h.history_json(&a).ok()?;
+        let hc = h.history_json(&c).ok()?;
+        let newest_a = v_arr(&ha, "versions").ok()?.first()?.get("kind").and_then(Value::as_str)?;
+        let newest_c = v_arr(&hc, "versions").ok()?.first()?.get("kind").and_then(Value::as_str)?;
+        (newest_a == "delete" && newest_c == "external").then_some((ha, hc))
+    });
+    let (ha, hc) = got.ok_or("collision rename was not recorded as delete + external within 10s")?;
+
+    // Old chain intact + exactly one delete marker appended.
+    if v_u64(&ha, "count")? != 3 {
+        return Err(format!("a.txt should have 2 old versions + 1 delete marker: {}", v_u64(&ha, "count")?));
+    }
+    // Destination chain intact + one external appended (its own old version stays).
+    let c_count = v_u64(&hc, "count")?;
+    if c_count != 2 {
+        return Err(format!("c.txt should have its own version + 1 external: {c_count}"));
+    }
+    // The destination's latest content is what landed on disk (a.txt's bytes).
+    let s = h.cli(&["show", &c.display().to_string(), "--at", "latest"])?;
+    if s.code != 0 || s.stdout != "a content v2\n" {
+        return Err(format!(
+            "c.txt latest must be the renamed content (exit {}): {:?}",
+            s.code,
+            truncate(&s.stdout, 120)
+        ));
+    }
+    // The chains stayed separate: c's seq-1 content is still its own.
+    let s = h.cli(&["show", &c.display().to_string(), "--at", "1"])?;
+    if s.code != 0 || s.stdout != "c own history\n" {
+        return Err(format!("c.txt seq 1 must still be its own content: {s:?}"));
+    }
+    Ok(
+        "collision rename kept the chains separate: a.txt 2 old + delete marker, c.txt own + external, contents byte-exact"
+            .into(),
+    )
+}
+
+// ---------------------------------------------------------------- S14
+
+/// Ten writes of one file inside ONE debounce window coalesce into exactly
+/// one version, whose content is the last write.
+fn s14_debounce_coalesce(ctx: &Ctx) -> Res {
+    let h = Harness::new(&ctx.lh, 1)?;
+    let ws = h.ws_path(0);
+    let f = ws.join("rapid.txt");
+    let p = f.display().to_string();
+    let mut last = String::new();
+    for i in 1..=10 {
+        last = format!("rapid write {i}\n");
+        io(fs::write(&f, &last), "failed to write rapid.txt")?;
+        sleep(Duration::from_millis(30)); // 10 × 30ms = 300ms < the 400ms debounce
+    }
+    h.wait_history(&f, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 1)
+    })?;
+    // Let every trailing event settle well past the debounce window.
+    sleep(Duration::from_millis(1500));
+    let j = h.history_json(&f)?;
+    let count = v_u64(&j, "count")?;
+    if count != 1 {
+        return Err(format!(
+            "10 writes within one debounce window must coalesce into 1 version, got {count}"
+        ));
+    }
+    let s = h.cli(&["show", &p, "--at", "latest"])?;
+    if s.code != 0 || s.stdout != last {
+        return Err(format!(
+            "coalesced version must be the LAST write (exit {}): {:?}",
+            s.code,
+            truncate(&s.stdout, 120)
+        ));
+    }
+    Ok("10 writes in 300ms coalesced into exactly 1 version = the last write".into())
+}
+
+// ---------------------------------------------------------------- S15
+
+/// A daemon killed hard mid-burst must not corrupt the store: after respawn
+/// the store opens, previously recorded history survives, and a fresh touch
+/// wave records every file byte-exactly (in-flight debounce state is allowed
+/// to be lost — that is the pinned contract, not a bug).
+fn s15_kill_mid_record(ctx: &Ctx) -> Res {
+    let mut h = Harness::new(&ctx.lh, 1)?;
+    let ws = h.ws_path(0);
+    let base = ws.join("base.txt");
+    io(fs::write(&base, "base before crash\n"), "failed to write base.txt")?;
+    h.wait_history(&base, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 1)
+    })?;
+
+    // Burst: 20 quick writes; the daemon dies right in the middle.
+    for i in 0..20 {
+        let f = ws.join(format!("burst_{i:02}.txt"));
+        io(fs::write(&f, format!("burst {i} pre-crash\n")), "failed to write burst file")?;
+        if i == 10 {
+            h.kill_daemon()?;
+        }
+        sleep(Duration::from_millis(30));
+    }
+    // Respawn on the same store — the single instance must take over cleanly.
+    h.spawn_daemon()?;
+
+    // Previously recorded history survives the crash.
+    let j = h.history_json(&base)?;
+    if v_u64(&j, "count")? < 1 {
+        return Err("base.txt history lost after the crash".into());
+    }
+
+    // Touch EVERY burst file: after respawn + quiet ≥ debounce each must be
+    // recorded, and the newest version must reconstruct byte-exactly.
+    for i in 0..20 {
+        let f = ws.join(format!("burst_{i:02}.txt"));
+        io(
+            fs::write(&f, format!("burst {i} post-respawn\n")),
+            "failed to touch burst file",
+        )?;
+    }
+    for i in 0..20 {
+        let f = ws.join(format!("burst_{i:02}.txt"));
+        let content = format!("burst {i} post-respawn\n");
+        h.wait_history(&f, 10_000, |v| {
+            v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 1)
+        })?;
+        let p = f.display().to_string();
+        let s = h.cli(&["show", &p, "--at", "latest"])?;
+        if s.code != 0 || s.stdout != content {
+            return Err(format!(
+                "show latest mismatch after crash for {} (exit {}): {:?}",
+                p,
+                s.code,
+                truncate(&s.stdout, 120)
+            ));
+        }
+    }
+    Ok("kill -9 mid-burst: store reopened cleanly, old history intact, all 20 files recorded byte-exact after respawn".into())
+}
+
+// ---------------------------------------------------------------- S16
+
+/// A corrupted blob must fail CLEANLY: show/diff exit non-zero with an error
+/// message (never a panic), the rest of the store stays usable, and the
+/// daemon keeps running.
+fn s16_corrupt_blob_recovery(ctx: &Ctx) -> Res {
+    let h = Harness::new(&ctx.lh, 1)?;
+    let ws = h.ws_path(0);
+    let f = ws.join("victim.txt");
+    let p = f.display().to_string();
+    io(fs::write(&f, "victim v1\n"), "failed to write victim.txt")?;
+    wave_gap();
+    io(fs::write(&f, "victim v2\n"), "failed to write victim.txt v2")?;
+    let hist = h.wait_history(&f, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 2)
+    })?;
+
+    // Locate seq 1's blob: workspaces/<ws:016x>/blobs/v<id>-full.zst
+    let ws_id = v_u64(
+        v_arr(&h.status_json()?, "workspaces")?
+            .first()
+            .ok_or("no workspace in status")?,
+        "id",
+    )?;
+    let v1 = find_seq(&hist, 1).ok_or("seq 1 missing from history")?;
+    let v1_id = v_i64(v1, "id")?;
+    let storage = v_str(v1, "storage")?.to_string();
+    let blob = h
+        .store
+        .path()
+        .join("workspaces")
+        .join(format!("{ws_id:016x}"))
+        .join("blobs")
+        .join(format!("v{v1_id}-{storage}.zst"));
+    if !blob.exists() {
+        return Err(format!("blob file not found at {}", blob.display()));
+    }
+    io(fs::write(&blob, b"this is not zstd data"), "failed to corrupt the blob")?;
+
+    // show on the corrupted seq → clean failure (non-zero, message, no panic).
+    let s_bad = h.cli(&["show", &p, "--at", "1"])?;
+    if s_bad.code == 0 {
+        return Err("show --at 1 must fail on a corrupted blob".into());
+    }
+    if s_bad.code == 101 || s_bad.code == 134 {
+        return Err(format!("show --at 1 panicked (exit {})", s_bad.code));
+    }
+    if s_bad.stdout.is_empty() && s_bad.stderr.is_empty() {
+        return Err("show --at 1 failed without any error message".into());
+    }
+    // diff involving the corrupted base → clean failure too.
+    let d = h.cli(&["diff", &p, "1", "current"])?;
+    if d.code == 0 || d.code == 101 || d.code == 134 {
+        return Err(format!("diff with a corrupted base must fail cleanly, exit {}", d.code));
+    }
+
+    // The untouched latest version still reconstructs; the daemon is alive.
+    let s_ok = h.cli(&["show", &p, "--at", "latest"])?;
+    if s_ok.code != 0 || s_ok.stdout != "victim v2\n" {
+        return Err(format!("latest version must survive the corruption: {s_ok:?}"));
+    }
+    if !h.daemon_alive() {
+        return Err("daemon died during corruption handling".into());
+    }
+    Ok(format!(
+        "corrupt blob: show/diff fail cleanly (exit {} / {}), latest still byte-exact, daemon alive",
+        s_bad.code, d.code
+    ))
+}
+
+// ---------------------------------------------------------------- S17
+
+/// 21 sequential edits: the delta policy must roll over to a full snapshot
+/// (chain of 20 deltas → next version is a full), and EVERY seq must
+/// reconstruct byte-exactly through `show --at k`.
+fn s17_delta_chain_rollover(ctx: &Ctx) -> Res {
+    let h = Harness::new(&ctx.lh, 1)?;
+    let f = h.ws_path(0).join("chain.txt");
+    let p = f.display().to_string();
+    let mut contents: Vec<String> = Vec::new();
+    for i in 1..=21 {
+        let c: String = (0..i).map(|k| format!("chain v{i} line {k}\n")).collect();
+        io(fs::write(&f, &c), "failed to write chain.txt")?;
+        contents.push(c);
+        h.wait_history(&f, 10_000, |v| {
+            v.get("count").and_then(Value::as_u64).is_some_and(|n| n as usize >= i)
+        })?;
+        wave_gap();
+    }
+    let hist = h.history_json(&f)?;
+    let count = v_u64(&hist, "count")?;
+    if count != 21 {
+        return Err(format!("21 edits must produce 21 versions (dedup never fires), got {count}"));
+    }
+    // seq 2..20 are deltas, seq 21 must be a full (chain hit the 20-delta cap).
+    let v21 = find_seq(&hist, 21).ok_or("seq 21 missing")?;
+    if v_str(v21, "storage")? != "full" {
+        return Err(format!(
+            "seq 21 must roll over to a full snapshot after 20 deltas: {}",
+            v21
+        ));
+    }
+    // Byte-exact reconstruction of every version.
+    for (i, c) in contents.iter().enumerate() {
+        let s = h.cli(&["show", &p, "--at", &(i + 1).to_string()])?;
+        if s.code != 0 || s.stdout != *c {
+            return Err(format!(
+                "show --at {} mismatch (exit {}): {:?}",
+                i + 1,
+                s.code,
+                truncate(&s.stdout, 100)
+            ));
+        }
+    }
+    Ok("21-edit chain: seq 21 rolled over to full, all 21 versions reconstruct byte-exact".into())
+}
+
+// ---------------------------------------------------------------- S18
+
+/// Reverting when disk already equals the target is a no-op: no pre_revert
+/// snapshot, no restore, history unchanged (the CLI reports pre_revert_seq
+/// null).
+fn s18_revert_noop(ctx: &Ctx) -> Res {
+    let h = Harness::new(&ctx.lh, 1)?;
+    let f = h.ws_path(0).join("noop.txt");
+    let p = f.display().to_string();
+    io(fs::write(&f, "noop v1\n"), "failed to write noop.txt")?;
+    wave_gap();
+    io(fs::write(&f, "noop v2\n"), "failed to write noop.txt v2")?;
+    h.wait_history(&f, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 2)
+    })?;
+
+    // Real revert first: disk goes back to v1, pre_revert + restore recorded.
+    let r = h.cli_json_value(&["revert", &p, "--yes", "--at", "1"])?;
+    if !v_bool(&r, "reverted")? {
+        return Err(format!("first revert reported reverted=false: {r}"));
+    }
+    if r.get("pre_revert_seq").map(Value::is_null).unwrap_or(true) {
+        return Err(format!("first revert must record a pre_revert snapshot: {r}"));
+    }
+    let before = h.history_json(&f)?;
+    let before_count = v_u64(&before, "count")?;
+
+    // Reverting again to the SAME seq (disk already there) → nothing changes.
+    let r2 = h.cli_json_value(&["revert", &p, "--yes", "--at", "1"])?;
+    if !v_bool(&r2, "reverted")? {
+        return Err(format!("no-op revert must still report reverted=true: {r2}"));
+    }
+    match r2.get("pre_revert_seq") {
+        Some(Value::Null) | None => {}
+        Some(other) => return Err(format!("no-op revert must not record pre_revert: {other}")),
+    }
+    let after = h.history_json(&f)?;
+    if v_u64(&after, "count")? != before_count {
+        return Err(format!(
+            "no-op revert must not add versions: {} -> {}",
+            before_count,
+            v_u64(&after, "count")?
+        ));
+    }
+    let disk = io(fs::read(&f), "failed to read after no-op revert")?;
+    if disk != b"noop v1\n" {
+        return Err("no-op revert must leave the disk untouched".into());
+    }
+    Ok(format!(
+        "no-op revert: reverted=true, pre_revert_seq null, history unchanged ({before_count} versions), disk byte-exact"
+    ))
 }
