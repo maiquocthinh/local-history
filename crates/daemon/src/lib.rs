@@ -206,10 +206,11 @@ pub fn run_with_root_paused(
         }
     })?;
 
-    // 6. Collector loop: new events → debounce map; on each wake, flush paths quiet ≥
-    //    DEBOUNCE_MS. Handled inline in this thread (kept simple); every record error is
-    //    logged and ignored.
+    // 6. Collector loop: new events → debounce map (renames take the pairing
+    //    shortcut); on each wake, flush paths quiet ≥ DEBOUNCE_MS. Handled inline in
+    //    this thread (kept simple); every record error is logged and ignored.
     let mut last_event: HashMap<String, Instant> = HashMap::new();
+    let mut pending_from: Option<(String, Instant)> = None;
     let debounce = Duration::from_millis(DEBOUNCE_MS);
     let tick = Duration::from_millis(COLLECTOR_INTERVAL_MS);
     loop {
@@ -221,8 +222,11 @@ pub fn run_with_root_paused(
         let paused = pause.load(Ordering::Relaxed);
         match rx.recv_timeout(tick) {
             Ok(Ok(event)) => {
-                if !paused {
-                    collect_event(&mut last_event, &event, &ws_entries);
+                if !paused
+                    && let Collected::Rename(from, to) =
+                        collect_event(&mut last_event, &mut pending_from, &event, &ws_entries)
+                {
+                    process_rename(&engine, &ws_entries, &from, &to);
                 }
             }
             Ok(Err(e)) => log::warn!("watcher lỗi (bỏ qua): {e}"),
@@ -232,7 +236,7 @@ pub fn run_with_root_paused(
         if paused {
             last_event.clear();
         } else {
-            drain_ready(&mut last_event, debounce, &engine, &ws_entries);
+            drain_ready(&mut last_event, &mut pending_from, debounce, &engine, &ws_entries);
         }
     }
 
@@ -563,20 +567,98 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Absorbs one event: only Create/Modify/Remove are kept (Access/Other dropped); the path
+/// Outcome of absorbing one watcher event.
+enum Collected {
+    /// Nothing to do (irrelevant kind, ignored path, or just a debounce clock reset).
+    None,
+    /// A paired rename inside one workspace — process immediately via `engine::rename`,
+    /// bypassing the debounce (the per-path route would record a bogus delete + create).
+    Rename(String, String),
+}
+
+/// true if the path belongs to a registered watch dir AND passes its ignore filter.
+fn trackable(path: &Path, ws_entries: &[(PathBuf, WorkspaceId)]) -> bool {
+    ws_entries
+        .iter()
+        .any(|(root, _)| under_dir(path, root) && !is_ignored_under(path, root))
+}
+
+/// Absorbs one event. Only Create/Modify/Remove are kept (Access/Other dropped); each path
 /// must pass the ignore filter and belong to a registered watch dir. A new event on the same
 /// path resets its debounce clock.
+///
+/// Renames get the pairing shortcut instead of the debounce: notify delivers either one
+/// `Modify(Name(Both))` event carrying `[from, to]` (Windows) or separate
+/// `Modify(Name(From))` + `Modify(Name(To))` events (Linux inotify). `From` stashes the old
+/// path in `pending_from`; the matching `To` returns [`Collected::Rename`]. A `To` without a
+/// stash is a plain appearance (moved in from outside) and goes through the debounce.
 fn collect_event(
     last_event: &mut HashMap<String, Instant>,
+    pending_from: &mut Option<(String, Instant)>,
     event: &notify::Event,
     ws_entries: &[(PathBuf, WorkspaceId)],
-) {
+) -> Collected {
     if !matches!(
         event.kind,
         notify::EventKind::Create(_) | notify::EventKind::Modify(_) | notify::EventKind::Remove(_)
     ) {
-        return;
+        return Collected::None;
     }
+
+    // One-event rename (Both), or the From leg of a two-event rename.
+    if let notify::EventKind::Modify(notify::event::ModifyKind::Name(mode)) = &event.kind {
+        match mode {
+            notify::event::RenameMode::Both if event.paths.len() == 2 => {
+                let (from, to) = (&event.paths[0], &event.paths[1]);
+                if trackable(from, ws_entries) && trackable(to, ws_entries) {
+                    last_event.remove(&from.to_string_lossy().into_owned());
+                    last_event.remove(&to.to_string_lossy().into_owned());
+                    *pending_from = None;
+                    return Collected::Rename(
+                        from.to_string_lossy().into_owned(),
+                        to.to_string_lossy().into_owned(),
+                    );
+                }
+                // Either leg untrackable → fall through to the plain debounce per path
+                // (records the create / delete-marker side of a cross-boundary move).
+            }
+            notify::event::RenameMode::From => {
+                let from = event.paths.first();
+                match from.filter(|p| trackable(p, ws_entries)) {
+                    Some(p) => {
+                        *pending_from =
+                            Some((p.to_string_lossy().into_owned(), Instant::now()));
+                    }
+                    None => *pending_from = None, // moved OUT of tracked space — drop any stash
+                }
+                return Collected::None;
+            }
+            _ => {} // RenameMode::To / Any → handled below or via the plain debounce
+        }
+    }
+
+    // To leg of a two-event rename: pair with the stashed From if there is one.
+    if matches!(
+        event.kind,
+        notify::EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::To))
+    ) {
+        let to = event
+            .paths
+            .iter()
+            .find(|p| trackable(p, ws_entries))
+            .map(|p| p.to_string_lossy().into_owned());
+        if let Some(to) = to {
+            if let Some((from, _)) = pending_from.take() {
+                last_event.remove(&from);
+                last_event.remove(&to);
+                return Collected::Rename(from, to);
+            }
+            // Unpaired To = the file appeared (moved in from outside) → plain debounce.
+            last_event.insert(to, Instant::now());
+        }
+        return Collected::None;
+    }
+
     for path in &event.paths {
         for (root, _) in ws_entries {
             if under_dir(path, root) {
@@ -587,15 +669,26 @@ fn collect_event(
             }
         }
     }
+    Collected::None
 }
 
 /// Flushes paths quiet ≥ `debounce` for processing — inline in the collector thread (kept simple).
+/// An unpaired `From` stash (the rename never got its `To`) expires after [`PAIR_TIMEOUT`]
+/// and is processed as a vanished file — the move-out-of-workspace case.
 fn drain_ready(
     last_event: &mut HashMap<String, Instant>,
+    pending_from: &mut Option<(String, Instant)>,
     debounce: Duration,
     engine: &LocalHistory,
     ws_entries: &[(PathBuf, WorkspaceId)],
 ) {
+    if let Some((from, at)) = pending_from
+        && at.elapsed() >= PAIR_TIMEOUT
+    {
+        let from = from.clone();
+        *pending_from = None;
+        process_one(engine, ws_entries, &from); // gone → delete marker via process_one
+    }
     let now = Instant::now();
     let ready: Vec<String> = last_event
         .iter()
@@ -605,6 +698,41 @@ fn drain_ready(
     for path in ready {
         last_event.remove(&path);
         process_one(engine, ws_entries, &path);
+    }
+}
+
+/// Window for the `From`→`To` pairing. inotify/ReadDirectoryChangesW emit the two legs
+/// back-to-back; anything slower is treated as a plain delete + create.
+const PAIR_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Processes a paired rename: the whole version chain moves to the new path via
+/// `engine::rename` (one version, kind=rename, label=old path). Moves across watch roots
+/// fall back to the plain per-path handling; on engine failure both legs are processed the
+/// plain way so nothing is silently lost. NEVER panics — same contract as `process_one`.
+fn process_rename(engine: &LocalHistory, ws_entries: &[(PathBuf, WorkspaceId)], from: &str, to: &str) {
+    let from_path = PathBuf::from(from);
+    let to_path = PathBuf::from(to);
+    let ws_of = |p: &Path| {
+        ws_entries
+            .iter()
+            .find(|(root, _)| under_dir(p, root))
+            .map(|(_, ws)| ws)
+    };
+    match (ws_of(&from_path), ws_of(&to_path)) {
+        (Some(&ws), Some(&w2)) if ws == w2 => match engine.rename(ws, &from_path, &to_path) {
+            Ok(Some(_)) => log::info!("đã record (rename): {from} → {to}"),
+            Ok(None) => {} // engine deduped / no-op
+            Err(e) => {
+                log::warn!("rename {from} → {to} lỗi ({e}) — fallback ghi từng path");
+                process_one(engine, ws_entries, from);
+                process_one(engine, ws_entries, to);
+            }
+        },
+        _ => {
+            // across watch roots (or one leg unresolvable): plain delete + create semantics
+            process_one(engine, ws_entries, from);
+            process_one(engine, ws_entries, to);
+        }
     }
 }
 

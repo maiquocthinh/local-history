@@ -130,3 +130,4 @@ time:
   days_ago_one: "%{n} day ago"
 tip:
   version: "seq %{seq} · %{kind} · hash %{hash}…"
+  renamed: "renamed from %{old}"

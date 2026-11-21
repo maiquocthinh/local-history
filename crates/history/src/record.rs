@@ -100,9 +100,10 @@ impl LocalHistory {
 
         // Dedup: same hash + kind as the latest version → no new version.
         // Delete is special: if the latest is already a Delete, skip regardless of content.
+        // Rename never dedups — it is an EVENT (path change), not a content change.
         let dup = match &latest {
             Some(l) if kind == EventKind::Delete => l.kind == EventKind::Delete,
-            Some(l) => l.kind == kind && l.content_hash == hash,
+            Some(l) => kind != EventKind::Rename && l.kind == kind && l.content_hash == hash,
             None => false,
         };
         if dup {
@@ -198,6 +199,68 @@ impl LocalHistory {
         // with `batch_id NULL`.
         self.assign_batch(ws, version_id, ts);
         Ok(Some(version_id))
+    }
+
+    /// Records a rename: the files row — with its WHOLE version chain — moves to the new
+    /// relative path, so history follows the file across the rename (JetBrains-style), and
+    /// one `Rename` version (label = the old rel path) is appended to the same chain.
+    ///
+    /// Returns `Ok(None)` when nothing was recorded (same path, or content over the cap).
+    /// Errors when `old_path` has no tracked row or `new_path` collides with a tracked row.
+    /// The content is read from `new_path`; blake3 dedup makes an unchanged-content rename
+    /// nearly free (the blob is reused).
+    pub fn rename(&self, ws: WorkspaceId, old_path: &Path, new_path: &Path) -> Result<Option<VersionId>> {
+        let old_rel = self.resolve_rel_path(ws, old_path)?;
+        let new_rel = self.resolve_rel_path(ws, new_path)?;
+        if old_rel == new_rel {
+            return Ok(None);
+        }
+        let content = std::fs::read(new_path)?;
+        if content.len() as u64 > MAX_FILE_SIZE {
+            log::warn!("bỏ qua rename ({}): lớn hơn MAX_FILE_SIZE", new_path.display());
+            return Ok(None);
+        }
+        {
+            let conn = self.conn.lock().unwrap();
+            let row_at = |rel: &str| -> Option<FileId> {
+                conn.query_row(
+                    "SELECT id FROM files WHERE workspace_id = ?1 AND rel_path = ?2",
+                    rusqlite::params![ws, rel],
+                    |r| r.get(0),
+                )
+                .ok()
+            };
+            let old_row = row_at(&old_rel);
+            let dest_row = row_at(&new_rel);
+            match (old_row, dest_row) {
+                // A tracked file already occupies the destination (e.g. an overwrite rename
+                // on disk): the two chains stay separate — the daemon's fallback records the
+                // delete marker on the old path and the new content on the destination.
+                (_, Some(_)) => {
+                    return Err(Error::NotFound(format!(
+                        "đích '{new_rel}' đã có history — không ghi đè"
+                    )));
+                }
+                (None, None) => {
+                    return Err(Error::NotFound(format!(
+                        "không có file '{old_rel}' để đổi tên"
+                    )));
+                }
+                (Some(_), None) => {}
+            }
+            let moved: usize = conn.execute(
+                "UPDATE files SET rel_path = ?1 WHERE workspace_id = ?2 AND rel_path = ?3",
+                rusqlite::params![new_rel, ws, old_rel],
+            )?;
+            if moved == 0 {
+                return Err(Error::NotFound(format!(
+                    "không có file '{old_rel}' để đổi tên"
+                )));
+            }
+        }
+        // The row now lives under the new rel — record() finds it and appends the Rename
+        // version to the SAME chain (dedup is disabled for Rename).
+        self.record(ws, new_path, &content, EventKind::Rename, Some(&old_rel))
     }
 
     /// Attaches the committed version to the open batch of `ws`, creating a batch when

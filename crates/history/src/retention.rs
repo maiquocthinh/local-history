@@ -163,6 +163,15 @@ impl LocalHistory {
         self.gc(ws, policy, now_micros(), false)
     }
 
+    /// Whether `id` exists in the versions table — a FRESH read, not the sweep's
+    /// `known` snapshot: another connection (the daemon) may have committed the
+    /// version between the snapshot and this file's turn to be examined.
+    fn version_exists(&self, id: VersionId) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT 1 FROM versions WHERE id = ?1", [id], |_| Ok(()))
+            .is_ok()
+    }
+
     /// Walks `workspaces_dir()` → each workspace dir → `blobs/`: a `v<id>-*.zst` file whose
     /// id is no longer in the db, or a stray `.tmp` file (record crashed midway), is an
     /// orphan. `dry_run` only counts; otherwise the file is removed (NotFound ignored) and
@@ -192,7 +201,11 @@ impl LocalHistory {
                 let orphan = if name.ends_with(".tmp") {
                     true
                 } else if let Some(id) = parse_blob_file_name(name) {
-                    !known.contains(&id)
+                    // Re-check under the connection lock: the version may have been
+                    // committed AFTER the `known` snapshot (GC runs on its own
+                    // connection while the daemon records) — deleting such a blob
+                    // would lose a committed version forever.
+                    !known.contains(&id) && !self.version_exists(id)
                 } else {
                     false
                 };

@@ -168,6 +168,75 @@ fn ignore_filtered() {
 }
 
 #[test]
+fn rename_keeps_chain() {
+    let store = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let engine = LocalHistory::open(store.path()).unwrap();
+    let ws_id = engine.register_workspace(ws.path()).unwrap();
+
+    let _daemon = TestDaemon::spawn(store.path(), ws.path());
+    thread::sleep(WARMUP);
+
+    // Two debounced writes → 2 externals on a.txt.
+    let a = ws.path().join("a.txt");
+    fs::write(&a, b"v1").unwrap();
+    wait_for("a.txt có version đầu", || {
+        engine.history(ws_id, &a).is_ok_and(|v| !v.is_empty())
+    });
+    fs::write(&a, b"v2").unwrap();
+    wait_for("a.txt có version thứ 2", || {
+        engine.history(ws_id, &a).is_ok_and(|v| v.len() >= 2)
+    });
+
+    let files_before = engine.list_files(ws_id, None).unwrap().len();
+    let a_history = engine.history(ws_id, &a).unwrap();
+
+    // The rename: From/To pairing must record ONE rename version carrying the chain over.
+    let b = ws.path().join("b.txt");
+    fs::rename(&a, &b).unwrap();
+    wait_for("b.txt kế thừa chain (≥3 version)", || {
+        engine.history(ws_id, &b).is_ok_and(|v| v.len() >= 3)
+    });
+
+    // history() is newest-first: the newest version must be the Rename itself.
+    let b_history = engine.history(ws_id, &b).unwrap();
+    let newest = b_history.first().unwrap();
+    assert_eq!(newest.kind, EventKind::Rename, "version mới nhất phải là rename");
+    assert_eq!(
+        newest.label.as_deref(),
+        Some("a.txt"),
+        "label rename phải là rel path cũ"
+    );
+    // The chain is the same lineage: the pre-rename versions of b match a's history.
+    assert_eq!(
+        b_history[1..].iter().map(|v| v.seq).collect::<Vec<_>>(),
+        a_history.iter().map(|v| v.seq).collect::<Vec<_>>(),
+        "chain cũ phải nguyên vẹn dưới path mới"
+    );
+
+    // The old path wrote NO delete marker (the rename was paired, not delete+create).
+    assert!(
+        engine.history(ws_id, &a).unwrap().is_empty(),
+        "path cũ không được có marker delete"
+    );
+    assert_eq!(
+        engine.list_files(ws_id, None).unwrap().len(),
+        files_before,
+        "files count không đổi sau rename"
+    );
+
+    // Writes continue on the new path → appended to the SAME chain.
+    fs::write(&b, b"v4").unwrap();
+    wait_for("b.txt ghi tiếp sau rename (≥4 version)", || {
+        engine.history(ws_id, &b).is_ok_and(|v| v.len() >= 4)
+    });
+    assert_eq!(
+        engine.history(ws_id, &b).unwrap().first().unwrap().kind,
+        EventKind::External
+    );
+}
+
+#[test]
 fn lock_single_instance() {
     let store = tempfile::tempdir().unwrap();
     let ws_a = tempfile::tempdir().unwrap();

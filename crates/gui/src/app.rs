@@ -1320,6 +1320,11 @@ impl App {
             hash = &v.content_hash[..v.content_hash.len().min(8)]
         )
         .to_string();
+        if v.kind == EventKind::Rename
+            && let Some(old) = &v.label
+        {
+            tip.push_str(&format!("\n{}", t!("tip.renamed", old = old)));
+        }
         if let Some(&bid) = self.batch_versions.get(&v.id) {
             let count = self
                 .batches

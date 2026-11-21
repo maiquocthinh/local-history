@@ -130,3 +130,4 @@ time:
   days_ago_one: "%{n} ngày trước"
 tip:
   version: "seq %{seq} · %{kind} · hash %{hash}…"
+  renamed: "đổi tên từ %{old}"

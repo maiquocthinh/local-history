@@ -141,7 +141,7 @@ pub fn registry() -> Vec<(&'static str, ScenarioFn)> {
         ("delete_restore", s3_delete_restore),
         ("label_flow", s4_label_flow),
         ("binary_file", s5_binary_file),
-        ("rename_contract_delete_plus_create", s6_rename_contract),
+        ("rename_keeps_chain", s6_rename_keeps_chain),
         ("multi_workspace", s7_multi_workspace),
         ("wave_200_files", s8_wave_200_files),
         ("self_update", s9_self_update),
@@ -467,9 +467,10 @@ fn s5_binary_file(ctx: &Ctx) -> Res {
 
 // ---------------------------------------------------------------- S6
 
-/// Pinned rename contract: `fs::rename a.txt -> b.txt` is recorded as
-/// delete(a.txt) + create(b.txt) — the daemon does NOT track renames.
-fn s6_rename_contract(ctx: &Ctx) -> Res {
+/// Pinned rename contract: `fs::rename a.txt -> b.txt` carries the WHOLE
+/// version chain over to the new path (JetBrains-style) — one rename version
+/// labeled with the old rel path, no delete marker, files count unchanged.
+fn s6_rename_keeps_chain(ctx: &Ctx) -> Res {
     let h = Harness::new(&ctx.lh, 1)?;
     let ws = h.ws_path(0);
     let a = ws.join("a.txt");
@@ -478,23 +479,85 @@ fn s6_rename_contract(ctx: &Ctx) -> Res {
     h.wait_history(&a, 10_000, |v| {
         v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 1)
     })?;
+    io(fs::write(&a, "rename contract revision 2\n"), "failed to write a.txt rev 2")?;
+    wave_gap();
+    io(fs::write(&a, "rename contract revision 3\n"), "failed to write a.txt rev 3")?;
+    let before = h.wait_history(&a, 10_000, |v| {
+        v.get("count").and_then(Value::as_u64).is_some_and(|c| c >= 3)
+    })?;
+    let n_before = before.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let files_before = v_u64(
+        v_arr(&h.status_json()?, "workspaces")?
+            .first()
+            .ok_or("no workspace in status")?,
+        "files",
+    )?;
 
     io(fs::rename(&a, &b), "failed to rename a.txt -> b.txt")?;
-    let pair = poll_until(10_000, POLL_INTERVAL_MS, || {
-        let ha = h.history_json(&a).ok()?;
+    let got = poll_until(10_000, POLL_INTERVAL_MS, || {
         let hb = h.history_json(&b).ok()?;
-        (hist_has_kind(&ha, "delete") && hist_has_kind(&hb, "external")).then_some((ha, hb))
+        let arr = v_arr(&hb, "versions").ok()?;
+        let newest = arr.first()?;
+        (v_str(newest, "kind").ok()? == "rename").then_some(hb)
     });
-    match pair {
-        Some((_, hb)) => {
-            let newest = v_arr(&hb, "versions")?.first().cloned().unwrap_or_default();
-            if v_str(&newest, "kind")? != "external" {
-                return Err(format!("b.txt newest version is not external: {newest}"));
-            }
-            Ok("rename recorded as delete(a.txt) + create(b.txt) — pinned delete+create behavior".into())
-        }
-        None => Err("rename was not recorded as delete(a.txt) + create(b.txt) within 10s".into()),
+    let hb = got.ok_or("b.txt did not gain a rename version within 10s")?;
+
+    // (i) chain moved over intact: n_before old versions + exactly one rename, newest-first.
+    let arr = v_arr(&hb, "versions")?;
+    if arr.len() as u64 != n_before + 1 {
+        return Err(format!(
+            "b.txt has {} versions, expected {} (old chain + 1 rename)",
+            arr.len(),
+            n_before + 1
+        ));
     }
+    let newest = arr.first().unwrap();
+    if v_str(newest, "label")? != "a.txt" {
+        return Err(format!("rename label is not the old rel path: {newest}"));
+    }
+    for v in before
+        .get("versions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let seq = v.get("seq").and_then(Value::as_i64).unwrap_or(0);
+        if find_seq(&hb, seq).is_none() {
+            return Err(format!("pre-rename seq {seq} missing from b.txt's chain"));
+        }
+    }
+
+    // (ii) the files count is unchanged (rename reuses the same file row).
+    let files_after = v_u64(
+        v_arr(&h.status_json()?, "workspaces")?
+            .first()
+            .ok_or("no workspace in status")?,
+        "files",
+    )?;
+    if files_after != files_before {
+        return Err(format!("files count changed {files_before} -> {files_after}"));
+    }
+
+    // (iii) the latest version reconstructs to the on-disk content.
+    let pb = b.display().to_string();
+    let s = h.cli(&["show", &pb, "--at", "latest"])?;
+    if s.code != 0 || s.stdout != "rename contract revision 3\n" {
+        return Err(format!(
+            "show latest mismatch (exit {}): {:?}",
+            s.code,
+            truncate(&s.stdout, 200)
+        ));
+    }
+
+    // (iv) the old path has NO history at all — no delete marker either.
+    let ha = h.history_json(&a)?;
+    if ha.get("count").and_then(Value::as_u64).unwrap_or(1) != 0 {
+        return Err(format!("a.txt still has history (delete marker?): {ha}"));
+    }
+    Ok(format!(
+        "rename kept the chain: {n_before} old versions moved to b.txt + 1 rename (label a.txt); \
+         files count {files_before} unchanged; show latest byte-exact; a.txt history empty"
+    ))
 }
 
 // ---------------------------------------------------------------- S7
