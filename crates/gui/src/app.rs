@@ -1505,17 +1505,13 @@ impl App {
         if total == 0 {
             return header;
         }
-        let layout = diff_view::measure_layout(ui, block.model.max_chars);
+        let layout = diff_view::measure_layout(ui);
+        let left = diff_view::wrap_lines(&block.model.left, layout.wrap_cols);
+        let right = diff_view::wrap_lines(&block.model.right, layout.wrap_cols);
+        let total = left.len().max(right.len());
         for r in 0..total {
             ui.horizontal(|ui| {
-                diff_view::draw_row_pair(
-                    ui,
-                    &layout,
-                    block.model.left.get(r),
-                    block.model.right.get(r),
-                    None,
-                    None,
-                );
+                diff_view::draw_row_pair(ui, &layout, left.get(r), right.get(r), None, None);
             });
         }
         // ponytail: char-level drag-select/copy inside the batch view — a later
@@ -1544,19 +1540,6 @@ impl App {
                 }
             };
             let pre_id = pick_pre_version(&hist, e.version.seq);
-            let hunks = match pre_id {
-                Some(pid) => match store.diff_lines(pid, e.version.id) {
-                    Ok(h) => Some(h),
-                    // one side is binary — the engine refused to diff; the
-                    // builder renders the binary note instead
-                    Err(history::Error::BinaryContent(_)) => None,
-                    Err(err) => {
-                        blocks.push(batch_note_block(e, t!("err.diff", e = err).to_string()));
-                        continue;
-                    }
-                },
-                None => Some(Vec::new()), // created in this batch — no hunks needed
-            };
             let pre_bytes = match pre_id {
                 Some(pid) => match store.content(pid) {
                     Ok(b) => b,
@@ -1578,6 +1561,24 @@ impl App {
                         continue;
                     }
                 },
+            };
+            let hunks = match pre_id {
+                Some(pid) => match store.diff_lines(pid, e.version.id) {
+                    Ok(h) => Some(h),
+                    // one side is binary — the engine refused to diff; the
+                    // builder renders the binary note instead
+                    Err(history::Error::BinaryContent(_)) => None,
+                    Err(err) => {
+                        blocks.push(batch_note_block(e, t!("err.diff", e = err).to_string()));
+                        continue;
+                    }
+                },
+                None => {
+                    // created in this batch: one full-insert hunk renders the
+                    // whole content on the right side (an EMPTY hunk list would
+                    // flag the block "identical" — wrong for a brand-new file)
+                    Some(vec![synth_insert_hunk(&batch_bytes)])
+                }
             };
             blocks.push(BatchBlock {
                 rel_path: e.rel_path.clone(),
@@ -1761,7 +1762,13 @@ impl App {
                     let ver_lines: Vec<Line> = state::split_lines(&left_text)
                         .into_iter()
                         .enumerate()
-                        .map(|(i, t)| Line { text: t.to_string(), no: Some(i + 1), del: false, add: false })
+                        .map(|(i, t)| Line {
+                            text: t.to_string(),
+                            no: Some(i + 1),
+                            del: false,
+                            add: false,
+                            cont: false,
+                        })
                         .collect();
                     return DiffModel {
                         left_title: t!("diff.disk_title").to_string(),
@@ -1949,6 +1956,21 @@ fn batch_entry_row(e: &BatchEntry) -> (String, String) {
 /// (the engine returns newest-first).
 pub fn pick_pre_version(history: &[Version], seq: i64) -> Option<VersionId> {
     history.iter().filter(|v| v.seq < seq).max_by_key(|v| v.seq).map(|v| v.id)
+}
+
+/// Full-insert hunk for a file CREATED inside the viewed batch: renders the
+/// whole content on the hunk's new side (pure — unit-tested with
+/// `diff_view::apply_hunks_to_sides`).
+fn synth_insert_hunk(batch_bytes: &[u8]) -> Hunk {
+    let text = String::from_utf8_lossy(batch_bytes);
+    let new_lines = state::split_lines(&text).len() as u64;
+    Hunk {
+        old_start: 1,
+        old_lines: 0,
+        new_start: 1,
+        new_lines,
+        new_text: text.into_owned(),
+    }
 }
 
 /// A block that only reports a store read failure: the header stays (rel path,
@@ -2240,6 +2262,27 @@ mod tests {
         v.size = 1536;
         let e = BatchEntry { rel_path: "src/main.rs".to_string(), version: v };
         assert_eq!(batch_entry_row(&e), ("src/main.rs".to_string(), "external · 1.5 KB".to_string()));
+    }
+
+    #[test]
+    fn synth_insert_hunk_renders_created_file_content() {
+        // a file CREATED inside the viewed batch: the synthesized insert hunk
+        // must render the whole content on the right side (empty left) — the
+        // regression where an empty hunk list flagged the block "identical"
+        let hunk = synth_insert_hunk(b"app=svc1\nretries=10\n");
+        let (left, right) =
+            diff_view::apply_hunks_to_sides(&[], &["app=svc1\n", "retries=10\n"], &[hunk]);
+        assert_eq!(left.len(), right.len(), "panes stay row-aligned");
+        assert!(left.iter().all(|l| l.no.is_none() && l.text.is_empty()), "left all filler");
+        let texts: Vec<&str> =
+            right.iter().map(|l| l.text.trim_end_matches(['\r', '\n'])).collect();
+        assert_eq!(texts, vec!["app=svc1", "retries=10"]);
+        // the model built from it is NOT identical (that flag means "both
+        // sides equal" — a brand-new file has content only on the right)
+        let v = ver(1, 1);
+        let m = build_batch_block(&v, &[], b"app=svc1\nretries=10\n", Some(&[synth_insert_hunk(b"app=svc1\nretries=10\n")]));
+        assert!(!m.identical, "created-in-batch block must not be flagged identical");
+        assert!(m.right.iter().any(|l| l.text.contains("app=svc1")));
     }
 
     #[test]

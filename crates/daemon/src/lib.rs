@@ -256,11 +256,16 @@ pub fn read_status(store_root: &Path) -> Option<DaemonStatus> {
     serde_json::from_str(&data).ok()
 }
 
-/// true if ANY path component is in `IGNORE_DIRS`. Used by the pre-debounce filter.
+/// true if ANY path component is in `IGNORE_DIRS`, or the file is an editor
+/// temp (`*.tmp` — write-then-rename intermediates are noise, never history).
+/// Used by the pre-debounce filter.
 pub fn is_ignored(path: &Path) -> bool {
-    path.components().any(|c| {
+    if path.components().any(|c| {
         IGNORE_DIRS.iter().any(|d| c.as_os_str().eq_ignore_ascii_case(*d))
-    })
+    }) {
+        return true;
+    }
+    path.extension().map(|e| e.eq_ignore_ascii_case("tmp")).unwrap_or(false)
 }
 
 // ---------- binary entry point (`lh-daemon`; main.rs is a thin wrapper around `run_app`) ----------
@@ -662,6 +667,16 @@ mod tests {
         );
         assert_eq!(cmd.get_program(), r"C:\bin\lh.exe");
         assert_eq!(cmd_args(&cmd), vec!["daemon", "--tray", "--dir", r"D:\ws"]);
+    }
+
+    #[test]
+    fn is_ignored_skips_editor_temp_files_but_keeps_real_ones() {
+        assert!(is_ignored(Path::new("ws/svc1.ini.tmp")));
+        assert!(is_ignored(Path::new("ws/notes.TXT.tmp")));
+        assert!(is_ignored(Path::new("ws/.git/config")));
+        assert!(is_ignored(Path::new("ws/target/debug/lh.exe")));
+        assert!(!is_ignored(Path::new("ws/src/main.rs")));
+        assert!(!is_ignored(Path::new("ws/svc1.ini")));
     }
 
     #[test]

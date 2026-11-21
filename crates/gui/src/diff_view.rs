@@ -34,27 +34,31 @@ pub struct Line {
     /// Line content verbatim, including the terminator (stripped when rendering).
     pub text: String,
     /// 1-based line number within the pane's content; `None` for filler rows
-    /// that pad a length mismatch between the two sides.
+    /// that pad a length mismatch between the two sides (and for wrap
+    /// continuation rows — see [`wrap_lines`]).
     pub no: Option<usize>,
     /// Deleted line (appears on the left side of a change).
     pub del: bool,
     /// Added line (appears on the right side of a change).
     pub add: bool,
+    /// Soft-wrap continuation segment: joins the previous row's logical line
+    /// when copying (no inserted newline between the two segments).
+    pub cont: bool,
 }
 
 impl Line {
     fn context(text: &str, no: usize) -> Self {
-        Line { text: text.to_string(), no: Some(no), del: false, add: false }
+        Line { text: text.to_string(), no: Some(no), del: false, add: false, cont: false }
     }
     fn del(text: &str, no: usize) -> Self {
-        Line { text: text.to_string(), no: Some(no), del: true, add: false }
+        Line { text: text.to_string(), no: Some(no), del: true, add: false, cont: false }
     }
     fn add(text: &str, no: usize) -> Self {
-        Line { text: text.to_string(), no: Some(no), del: false, add: true }
+        Line { text: text.to_string(), no: Some(no), del: false, add: true, cont: false }
     }
     /// Filler row padding a length mismatch — neutral, never colored.
     fn filler() -> Self {
-        Line { text: String::new(), no: None, del: false, add: false }
+        Line { text: String::new(), no: None, del: false, add: false, cont: false }
     }
 }
 
@@ -191,21 +195,68 @@ pub struct DiffLayout {
     pub row_h: f32,
     /// Width of one monospace char (drives the caret→column mapping).
     pub char_w: f32,
-    /// Width of one cell (gutter + text), at least half the available width.
+    /// Width of one cell (gutter + text) — exactly half the available width.
     pub cell_w: f32,
+    /// Display chars per row before a line soft-wraps into a continuation row.
+    pub wrap_cols: usize,
 }
 
-/// Measures the side-by-side grid for `max_chars` (the longest line on either
-/// side): the cell is at least half the available width, stretched by the
-/// longest line.
-pub fn measure_layout(ui: &mut egui::Ui, max_chars: usize) -> DiffLayout {
+/// Measures the side-by-side grid: cells are EXACTLY half the available
+/// width (never wider — long lines soft-wrap instead of scrolling the grid
+/// horizontally, which used to drag the line-number gutters out of view).
+pub fn measure_layout(ui: &mut egui::Ui) -> DiffLayout {
     let font = diff_font();
     let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 4.0;
     let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0')).max(0.5);
     let avail = ui.available_width() - 20.0;
-    let min_cell = (avail / 2.0).max(120.0);
-    let content_w = GUTTER + 8.0 + max_chars as f32 * char_w;
-    DiffLayout { row_h, char_w, cell_w: min_cell.max(content_w) }
+    let cell_w = (avail / 2.0).max(120.0);
+    let wrap_cols =
+        (((cell_w - GUTTER - 8.0) / char_w).floor() as usize).max(20);
+    DiffLayout { row_h, char_w, cell_w, wrap_cols }
+}
+
+/// Soft-wraps every line longer than `cols` display chars into continuation
+/// rows, keeping the uniform row-height grid intact (no horizontal scrolling
+/// anywhere). The FIRST segment keeps the line number; continuation rows get
+/// `cont = true` (copy logic joins them without inserted newlines) and
+/// `no = None`. Segments carry no terminator — `line_content` semantics are
+/// unchanged. Tabs count as one char here but render as four spaces, so a
+/// tab-heavy wrapped line may exceed the cell by a few chars (clipped by the
+/// cell painter).
+pub fn wrap_lines(lines: &[Line], cols: usize) -> Vec<Line> {
+    let mut out = Vec::with_capacity(lines.len());
+    for l in lines {
+        let content: Vec<char> = line_content(l).chars().collect();
+        if content.len() <= cols {
+            out.push(l.clone());
+            continue;
+        }
+        let chunks = content.chunks(cols).count();
+        for (idx, chunk) in content.chunks(cols).enumerate() {
+            let mut seg = Line {
+                text: chunk.iter().collect(),
+                no: if idx == 0 { l.no } else { None },
+                del: l.del,
+                add: l.add,
+                cont: idx > 0,
+            };
+            if idx == chunks - 1 && l.text.ends_with('\n') {
+                seg.text.push('\n'); // keep the terminator on the last segment
+            }
+            out.push(seg);
+        }
+    }
+    out
+}
+
+/// A display copy of the model whose rows are soft-wrapped to `cols` — the
+/// selection/copy layer operates on the SAME wrapped rows the painter draws,
+/// so carets, highlight and copied text stay consistent.
+fn wrap_model(model: &DiffModel, cols: usize) -> DiffModel {
+    let mut w = model.clone();
+    w.left = wrap_lines(&model.left, cols);
+    w.right = wrap_lines(&model.right, cols);
+    w
 }
 
 /// Status text shown above the panes: an explicit note, or the "identical"
@@ -411,12 +462,15 @@ pub fn selection_text(model: &DiffModel, sel: &TextSelection) -> String {
 
 /// The selected substring of every in-range cell, in iteration order. Empty
 /// ranges (filler rows, end-of-line carets) keep an empty segment so the join
-/// preserves blank lines.
+/// preserves blank lines. Soft-wrap continuation rows (cont = true) whose
+/// predecessor in the SAME pane was also selected join the previous segment
+/// with NO inserted newline — a wrapped logical line copies back as one line.
 fn selection_segments(model: &DiffModel, from: CaretPos, to: CaretPos) -> Vec<String> {
     // iterate only as far as the model goes; stale rows beyond it are skipped
     let max_row = model.left.len().max(model.right.len()).saturating_sub(1);
     let last_row = to.row.min(max_row);
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut last: Option<(Pane, usize)> = None;
     for row in from.row..=last_row {
         for pane in [Pane::Left, Pane::Right] {
             let lines = match pane {
@@ -428,7 +482,14 @@ fn selection_segments(model: &DiffModel, from: CaretPos, to: CaretPos) -> Vec<St
                 continue;
             };
             let t = line_content(line);
-            out.push(t.chars().skip(c0).take(c1.saturating_sub(c0)).collect());
+            let seg: String = t.chars().skip(c0).take(c1.saturating_sub(c0)).collect();
+            let contiguous = line.cont && last == Some((pane, row.wrapping_sub(1)));
+            if contiguous && let Some(prev) = out.last_mut() {
+                prev.push_str(&seg);
+            } else {
+                out.push(seg);
+            }
+            last = Some((pane, row));
         }
     }
     out
@@ -601,11 +662,14 @@ pub fn show_diff(
         return None;
     }
 
-    // Grid geometry: shared with the batch view blocks (same cell sizing math).
-    let layout = measure_layout(ui, model.max_chars);
+    // Grid geometry: cells fit the viewport exactly; long lines soft-wrap into
+    // continuation rows (no horizontal scrolling — the gutters stay put).
+    let layout = measure_layout(ui);
+    let wrapped = wrap_model(model, layout.wrap_cols);
+    let total = wrapped.left.len().max(wrapped.right.len());
 
     // Two column headings (same width split as the minimum content layout).
-    draw_pane_headings(ui, &model.left_title, &model.right_title);
+    draw_pane_headings(ui, &wrapped.left_title, &wrapped.right_title);
 
     // Events collected while drawing, processed after the row loop (the paint
     // of this frame already used the previous selection state; the update is
@@ -621,15 +685,15 @@ pub fn show_diff(
     let mut copied_pane: Option<usize> = None;
     let mut want_unified = false;
 
-    // ONE ScrollArea walking row indexes → both columns in the same row ⇒
-    // scrolling stays in sync naturally.
-    egui::ScrollArea::both()
+    // ONE vertical ScrollArea walking row indexes → both columns in the same
+    // row ⇒ scrolling stays in sync naturally; no horizontal axis at all.
+    egui::ScrollArea::vertical()
         .id_salt("diff_scroll")
         .auto_shrink([false, false])
         .show_rows(ui, layout.row_h, total, |ui, rows| {
             for r in rows {
-                let l = model.left.get(r);
-                let rt = model.right.get(r);
+                let l = wrapped.left.get(r);
+                let rt = wrapped.right.get(r);
                 let norm = sel.normalized();
                 let fill_l = norm.and_then(|(f, t)| {
                     cell_selected_cols(f, t, r, Pane::Left, l.map(line_chars).unwrap_or(0))
@@ -740,7 +804,7 @@ pub fn show_diff(
         && ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)))
         && ui.memory(|m| m.focused().is_none())
     {
-        let text = selection_text(model, sel);
+        let text = selection_text(&wrapped, sel);
         // every cell contributes exactly one line (terminators are stripped),
         // so the "{n} segment(s)" count = the non-empty lines of the text —
         // blank filler lines in the middle of a range are not segments
@@ -1214,5 +1278,61 @@ mod tests {
         assert_eq!(pane_row_len(&m, Pane::Left, 2), 0); // filler row
         assert_eq!(pane_row_len(&m, Pane::Left, 99), 0); // beyond the model
         assert_eq!(pane_row_len(&m, Pane::Right, 2), 5); // "extra"
+    }
+
+    // ----- soft wrap: long lines become continuation rows -----
+
+    #[test]
+    fn wrap_lines_passes_short_lines_through() {
+        let lines = vec![Line::context("ab\n", 1), Line::filler()];
+        let wrapped = wrap_lines(&lines, 80);
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped, lines, "lines within the column budget are untouched");
+    }
+
+    #[test]
+    fn wrap_lines_splits_long_line_into_cont_segments() {
+        // "abcdef\n" at 2 cols → "ab", "cd", "ef\n": first keeps the number,
+        // continuations are marked cont + no=None, terminator rides the last
+        let lines = vec![Line::context("abcdef\n", 7)];
+        let wrapped = wrap_lines(&lines, 2);
+        assert_eq!(wrapped.len(), 3);
+        assert_eq!(wrapped[0].text, "ab");
+        assert_eq!(wrapped[0].no, Some(7));
+        assert!(!wrapped[0].cont);
+        assert_eq!(wrapped[1].text, "cd");
+        assert_eq!(wrapped[1].no, None);
+        assert!(wrapped[1].cont);
+        assert_eq!(wrapped[2].text, "ef\n");
+        assert!(wrapped[2].cont);
+        assert_eq!(line_content(&wrapped[2]), "ef");
+        // del/add tint survives the split
+        let lines = vec![Line::del("x y z\n", 1)];
+        let wrapped = wrap_lines(&lines, 2);
+        assert!(wrapped.iter().all(|l| l.del));
+    }
+
+    #[test]
+    fn selection_across_wrapped_rows_joins_without_newlines() {
+        // "abcdefghij" wrapped at 4 → "abcd"(cont=false) + "efgh"(cont) +
+        // "ij"(cont): selecting the whole logical line copies it back as ONE
+        // line, exactly what an editor copy does
+        let mut m = DiffModel {
+            left_title: "left".into(),
+            right_title: "right".into(),
+            left: wrap_lines(&[Line::context("abcdefghij\n", 1)], 4),
+            right: vec![Line::context("abcdefghij\n", 1)],
+            binary: false,
+            note: None,
+            identical: false,
+            max_chars: 10,
+        };
+        m.compute_max_chars();
+        assert_eq!(m.left.len(), 3, "one logical line → three wrapped rows");
+        let sel = sel_from_to(caret(0, Pane::Left, 0), caret(2, Pane::Left, 2));
+        assert_eq!(selection_text(&m, &sel), "abcdefghij");
+        // a partial selection spanning the wrap boundary joins too
+        let sel = sel_from_to(caret(1, Pane::Left, 1), caret(2, Pane::Left, 1));
+        assert_eq!(selection_text(&m, &sel), "fghi");
     }
 }
