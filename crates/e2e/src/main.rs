@@ -6,11 +6,17 @@
 //!
 //! Usage:
 //! ```text
-//! lh-e2e [--lh PATH] [--filter SUBSTRING]
+//! lh-e2e [--lh PATH] [--filter SUBSTRING] [--suite smoke|full] [--json]
 //! ```
 //! - `--lh PATH` overrides the binary under test (default order: `--lh` flag >
 //!   env `LH_BIN` > `target/debug/lh(.exe)` in this workspace).
 //! - `--filter SUBSTRING` runs only the scenarios whose name contains it.
+//! - `--suite smoke` runs the fast 12-scenario set (per-commit), `full` runs
+//!   everything (default; pre-release).
+//! - `--json` prints progress to stderr and one machine-readable summary
+//!   object to stdout (CI-friendly).
+//! - `LH_E2E_KEEP=1` keeps every scenario's temp dirs on disk (paths printed
+//!   to stderr) — artifact retention for debugging failures.
 //!
 //! Every scenario runs on its own thread with a hard 120s wall-clock deadline;
 //! output is `PASS <name>` / `FAIL <name>: <reason>` and the process exits 0
@@ -30,12 +36,28 @@ use scenarios::{registry, ScenarioFn};
 /// Hard wall-clock deadline for one scenario.
 const SCENARIO_DEADLINE: Duration = Duration::from_secs(120);
 
+/// The fast smoke suite: the original 12 scenarios (per-commit set).
+const SMOKE_SCENARIOS: [&str; 12] = [
+    "base_flow",
+    "batch_waves",
+    "delete_restore",
+    "label_flow",
+    "binary_file",
+    "rename_keeps_chain",
+    "multi_workspace",
+    "wave_200_files",
+    "self_update",
+    "daemon_resilience",
+    "gc_dry_run",
+    "ignored_dirs",
+];
+
 fn main() {
     std::process::exit(run());
 }
 
 fn run() -> i32 {
-    let (lh_flag, filter) = match parse_args() {
+    let (lh_flag, filter, suite, as_json) = match parse_args() {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -47,46 +69,78 @@ fn run() -> i32 {
             return 1;
         }
     };
-    println!("lh binary: {}", lh.display());
 
     let all = registry();
     let selected: Vec<(&'static str, ScenarioFn)> = all
         .into_iter()
+        .filter(|(name, _)| match suite.as_deref() {
+            Some("smoke") => SMOKE_SCENARIOS.contains(name),
+            _ => true,
+        })
         .filter(|(name, _)| filter.as_deref().is_none_or(|f| name.contains(f)))
         .collect();
     if selected.is_empty() {
-        eprintln!("no scenario name contains {filter:?}");
+        eprintln!("no scenario matches filter={filter:?} suite={suite:?}");
         return 2;
     }
 
+    // --json: progress goes to stderr, the final summary to stdout.
+    let out = |s: &str| {
+        if as_json {
+            eprintln!("{s}");
+        } else {
+            println!("{s}");
+        }
+    };
+
+    let binary = lh.display().to_string();
+    let suite_label = suite.clone().unwrap_or_else(|| "full".into());
+    out(&format!("lh binary: {binary}"));
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
     let mut failed: Vec<String> = Vec::new();
     let mut passed = 0usize;
     for (name, func) in &selected {
         // Kill leftovers of a previously timed-out scenario, if any.
         kill_all_live_daemons();
-        println!("--- running {name}");
+        out(&format!("--- running {name}"));
         match run_scenario(name, *func, &lh) {
             Ok(note) => {
                 passed += 1;
-                println!("PASS {name}");
+                out(&format!("PASS {name}"));
                 if !note.is_empty() {
-                    println!("      {note}");
+                    out(&format!("      {note}"));
                 }
+                results.push(serde_json::json!({ "name": name, "status": "pass", "note": note }));
             }
             Err(reason) => {
                 failed.push(format!("{name}: {reason}"));
-                println!("FAIL {name}: {reason}");
+                out(&format!("FAIL {name}: {reason}"));
+                results.push(serde_json::json!({ "name": name, "status": "fail", "note": reason }));
             }
         }
     }
 
-    println!();
-    println!(
+    out("");
+    out(&format!(
         "{} passed, {} failed (of {} selected)",
         passed,
         failed.len(),
         selected.len()
-    );
+    ));
+    if as_json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "binary": binary,
+                "suite": suite_label,
+                "total": selected.len(),
+                "passed": passed,
+                "failed": failed.len(),
+                "results": results,
+            })
+        );
+    }
     if failed.is_empty() {
         0
     } else {
@@ -94,11 +148,13 @@ fn run() -> i32 {
     }
 }
 
-/// Parse `--lh PATH` and `--filter SUBSTRING`; returns `(lh, filter)` or the
-/// exit code to use.
-fn parse_args() -> Result<(Option<String>, Option<String>), i32> {
+/// Parse `--lh PATH`, `--filter SUBSTRING`, `--suite smoke|full` and `--json`;
+/// returns `(lh, filter, suite, json)` or the exit code to use.
+fn parse_args() -> Result<(Option<String>, Option<String>, Option<String>, bool), i32> {
     let mut lh: Option<String> = None;
     let mut filter: Option<String> = None;
+    let mut suite: Option<String> = None;
+    let mut as_json = false;
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
@@ -117,17 +173,32 @@ fn parse_args() -> Result<(Option<String>, Option<String>), i32> {
                     return Err(2);
                 }
             },
+            "--suite" => match it.next() {
+                Some(v) if v == "smoke" || v == "full" => suite = Some(v.clone()),
+                Some(other) => {
+                    eprintln!("--suite must be `smoke` or `full`, got `{other}`");
+                    return Err(2);
+                }
+                None => {
+                    eprintln!("--suite needs smoke|full");
+                    return Err(2);
+                }
+            },
+            "--json" => as_json = true,
             "--help" | "-h" => {
-                println!("usage: lh-e2e [--lh PATH] [--filter SUBSTRING]");
+                println!("usage: lh-e2e [--lh PATH] [--filter SUBSTRING] [--suite smoke|full] [--json]");
+                println!("env: LH_E2E_KEEP=1 keeps every scenario's temp dirs on disk");
                 return Err(0);
             }
             other => {
-                eprintln!("unknown argument `{other}` — usage: lh-e2e [--lh PATH] [--filter SUBSTRING]");
+                eprintln!(
+                    "unknown argument `{other}` — usage: lh-e2e [--lh PATH] [--filter SUBSTRING] [--suite smoke|full] [--json]"
+                );
                 return Err(2);
             }
         }
     }
-    Ok((lh, filter))
+    Ok((lh, filter, suite, as_json))
 }
 
 /// Run one scenario on a worker thread with a hard deadline; a panic or a

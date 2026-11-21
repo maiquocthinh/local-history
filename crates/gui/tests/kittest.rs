@@ -634,3 +634,63 @@ fn vi_locale_translates_the_chrome() {
     // the English labels must be gone from the tab strip
     assert_eq!(h.query_all(By::new().label("Files")).count(), 0);
 }
+
+/// Two-workspace store: switching the active workspace repopulates the file
+/// list with the other workspace's file. (Adding a workspace itself goes
+/// through the native rfd folder dialog — not drivable headless — so the
+/// switch path is what this test pins.)
+#[test]
+fn ws_switch_populates_the_file_list() {
+    let _locale = locale_guard();
+    let store = TempDir::new().unwrap();
+    let ws1 = TempDir::new().unwrap();
+    let ws2 = TempDir::new().unwrap();
+    let lh = LocalHistory::open(store.path()).unwrap();
+    let id1 = lh.register_workspace(ws1.path()).unwrap();
+    let id2 = lh.register_workspace(ws2.path()).unwrap();
+    let notes1 = ws1.path().join("ws1-file.txt");
+    std::fs::write(&notes1, "workspace one\n").unwrap();
+    lh.record(id1, &notes1, b"workspace one\n", EventKind::External, None).unwrap();
+    let notes2 = ws2.path().join("ws2-file.txt");
+    std::fs::write(&notes2, "workspace two\n").unwrap();
+    lh.record(id2, &notes2, b"workspace two\n", EventKind::External, None).unwrap();
+    let store_root = store.path().to_path_buf();
+    let seed = Seed { _store: store, _ws: ws1, store_root, notes: notes1 };
+    // ws2's TempDir must outlive the harness — leak it (test process exits anyway)
+    std::mem::forget(ws2);
+
+    let mut h = make_harness(&seed, Some(&seed.notes));
+    h.run();
+    select_notes(&mut h, &seed);
+    h.run();
+    assert!(
+        h.query_all(By::new().label_contains("ws1-file.txt")).count() >= 1,
+        "ws1 file must be listed on start"
+    );
+
+    // switch to the second workspace — replicate what the private switch_ws
+    // does (clears the selection, resets the token, forces a poll)
+    h.state_mut().current_ws = Some(id2);
+    h.state_mut().files.clear();
+    h.state_mut().versions.clear();
+    h.state_mut().selected_file = None;
+    h.state_mut().selected_version = None;
+    h.state_mut().last_token = 0;
+    h.state_mut().force_refresh = true;
+    h.state_mut().next_poll = None;
+    h.run();
+    h.run();
+
+    // file-list rows are role-Unknown nodes labelled with the file name
+    let list_rows = |h: &Harness<App>, name: &str| {
+        h.query_all(By::new().label_contains(name))
+            .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::Unknown)
+            .count()
+    };
+    assert!(list_rows(&h, "ws2-file.txt") >= 1, "ws2 file must be listed after the switch");
+    assert_eq!(
+        list_rows(&h, "ws1-file.txt"),
+        0,
+        "ws1 file must be gone from the list after the switch"
+    );
+}

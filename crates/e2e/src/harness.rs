@@ -258,13 +258,16 @@ fn status_json_direct(lh: &Path, store: &Path) -> Result<Value, String> {
 pub struct Harness {
     /// Path of the `lh` binary under test.
     pub lh: PathBuf,
-    /// Store root temp dir (removed on drop).
+    /// Store root temp dir (removed on drop — unless `LH_E2E_KEEP=1`).
     pub store: TempDir,
-    /// Workspace root temp dirs (removed on drop).
+    /// Workspace root temp dirs (removed on drop — unless `LH_E2E_KEEP=1`).
     pub ws: Vec<TempDir>,
     /// stdout+stderr log of the current daemon, inside the store dir.
     pub daemon_log: PathBuf,
     daemon: Option<Arc<Mutex<Option<Child>>>>,
+    /// `LH_E2E_KEEP=1`: on drop the temp dirs are NOT deleted (artifact
+    /// retention for debugging a failed scenario) and their paths are printed.
+    keep: bool,
 }
 
 impl Harness {
@@ -295,6 +298,7 @@ impl Harness {
             ws,
             daemon_log: log,
             daemon: Some(handle),
+            keep: std::env::var("LH_E2E_KEEP").is_ok_and(|v| v == "1"),
         })
     }
 
@@ -463,9 +467,23 @@ impl Harness {
 }
 
 impl Drop for Harness {
-    /// Teardown: kill the daemon, then the fields (store/ws temp dirs) drop.
+    /// Teardown: kill the daemon, then the fields (store/ws temp dirs) drop —
+    /// unless `LH_E2E_KEEP=1`, in which case the dirs are kept on disk for
+    /// inspection and their paths printed to stderr.
     fn drop(&mut self) {
         let _ = self.kill_daemon();
+        if self.keep {
+            let _ = self.store.disable_cleanup(true);
+            for w in &mut self.ws {
+                let _ = w.disable_cleanup(true);
+            }
+            eprintln!(
+                "LH_E2E_KEEP: store={} ws={:?} daemon_log={}",
+                self.store.path().display(),
+                self.ws.iter().map(|w| w.path().display().to_string()).collect::<Vec<_>>(),
+                self.daemon_log.display()
+            );
+        }
     }
 }
 

@@ -164,6 +164,8 @@ pub fn registry() -> Vec<(&'static str, ScenarioFn)> {
         ("orphan_blob_gc", s25_orphan_blob_gc),
         ("max_file_size_cap", s26_max_file_size_cap),
         ("command_matrix", s27_command_matrix),
+        ("update_noop", s28_update_noop),
+        ("version_file_missing", s29_version_file_missing),
     ]
 }
 
@@ -1795,5 +1797,128 @@ fn s27_command_matrix(ctx: &Ctx) -> Res {
     }
     Ok(format!(
         "command matrix: status/workspaces/history/show/diff/label/gc/batches/batch/revert-batch (id {batch_id}) all exit 0, JSON shapes verified, self-update --check fails cleanly"
+    ))
+}
+
+// ---------------------------------------------------------------- S28
+
+/// Self-update against a manifest whose version EQUALS the running build:
+/// exit 0, up_to_date=true, nothing swapped, install untouched.
+fn s28_update_noop(ctx: &Ctx) -> Res {
+    let lh = &ctx.lh;
+    let exe_name = format!("lh{}", std::env::consts::EXE_SUFFIX);
+    let lh_bytes = io(fs::read(lh), "failed to read the lh binary")?;
+
+    let install = temp_dir("noop install dir")?;
+    let dist = temp_dir("noop dist dir")?;
+    io(fs::write(install.path().join(&exe_name), &lh_bytes), "failed to write the install exe")?;
+    io(
+        fs::write(install.path().join("VERSION.txt"), "same version\n"),
+        "failed to write the install VERSION.txt",
+    )?;
+    io(fs::write(dist.path().join(&exe_name), &lh_bytes), "failed to write the dist exe")?;
+    io(fs::write(dist.path().join("VERSION.txt"), "same version\n"), "failed to write the dist VERSION.txt")?;
+    let manifest = serde_json::json!({
+        // the cli crate version — equal to current_version() in the binary
+        "version": "0.1.0",
+        "artifacts": [
+            { "name": exe_name, "sha256": sha256_hex(&lh_bytes) },
+            { "name": "VERSION.txt", "sha256": sha256_hex(b"same version\n") },
+        ],
+    });
+    io(
+        fs::write(
+            dist.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).map_err(|e| format!("manifest: {e}"))?,
+        ),
+        "failed to write manifest.json",
+    )?;
+
+    let out = run_self_update(&install.path().join(&exe_name), dist.path())?;
+    if out.code != 0 {
+        return Err(format!(
+            "equal-version self-update exited {} (expected 0)\nstdout: {}\nstderr: {}",
+            out.code,
+            truncate(&out.stdout, 600),
+            truncate(&out.stderr, 300)
+        ));
+    }
+    let j = out.json()?;
+    if !v_bool(&j, "up_to_date")? {
+        return Err(format!("equal-version self-update must report up_to_date=true: {j}"));
+    }
+    let updated: Vec<String> = v_arr(&j, "updated")?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    if !updated.is_empty() {
+        return Err(format!("equal-version self-update must swap nothing, updated={updated:?}"));
+    }
+    let ver = io(fs::read(install.path().join("VERSION.txt")), "failed to re-read VERSION.txt")?;
+    if ver != b"same version\n" {
+        return Err("VERSION.txt changed on an up-to-date run".into());
+    }
+    Ok("equal-version self-update: exit 0, up_to_date=true, nothing swapped, install untouched".into())
+}
+
+// ---------------------------------------------------------------- S29
+
+/// A manifest referencing an artifact that is MISSING from the dist dir fails
+/// cleanly (error JSON, no panic) and leaves the install untouched.
+fn s29_version_file_missing(ctx: &Ctx) -> Res {
+    let lh = &ctx.lh;
+    let exe_name = format!("lh{}", std::env::consts::EXE_SUFFIX);
+    let lh_bytes = io(fs::read(lh), "failed to read the lh binary")?;
+
+    let install = temp_dir("missing install dir")?;
+    let dist = temp_dir("missing dist dir")?;
+    io(fs::write(install.path().join(&exe_name), &lh_bytes), "failed to write the install exe")?;
+    io(
+        fs::write(install.path().join("VERSION.txt"), "original\n"),
+        "failed to write the install VERSION.txt",
+    )?;
+    // the dist has the exe but NOT the VERSION.txt the manifest promises
+    io(fs::write(dist.path().join(&exe_name), &lh_bytes), "failed to write the dist exe")?;
+    let manifest = serde_json::json!({
+        "version": "999.0.0",
+        "artifacts": [
+            { "name": exe_name, "sha256": sha256_hex(&lh_bytes) },
+            { "name": "VERSION.txt", "sha256": sha256_hex(b"never written\n") },
+        ],
+    });
+    io(
+        fs::write(
+            dist.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).map_err(|e| format!("manifest: {e}"))?,
+        ),
+        "failed to write manifest.json",
+    )?;
+
+    let out = run_self_update(&install.path().join(&exe_name), dist.path())?;
+    if out.code == 0 {
+        return Err(format!(
+            "self-update with a missing artifact exited 0 (expected failure)\nstdout: {}",
+            truncate(&out.stdout, 600)
+        ));
+    }
+    if out.code == 101 || out.code == 134 {
+        return Err(format!("self-update panicked on the missing artifact (exit {})", out.code));
+    }
+    let j = out.json()?;
+    if j.get("error").is_none() {
+        return Err(format!("the failed self-update did not report an error: {j}"));
+    }
+    let exe_after = io(fs::read(install.path().join(&exe_name)), "failed to re-read the install exe")?;
+    if exe_after != lh_bytes {
+        return Err("the install exe changed despite the missing-artifact failure".into());
+    }
+    let ver = io(fs::read(install.path().join("VERSION.txt")), "failed to re-read VERSION.txt")?;
+    if ver != b"original\n" {
+        return Err("VERSION.txt changed despite the missing-artifact failure".into());
+    }
+    Ok(format!(
+        "missing artifact: self-update failed cleanly (exit {}), error reported, install untouched",
+        out.code
     ))
 }
