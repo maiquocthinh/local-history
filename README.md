@@ -78,10 +78,10 @@ exe, and `lh self-update` keeps it current from a self-hosted manifest source.
 ## Testing
 
 ```bash
-cargo test --workspace                  # unit + integration (~200 tests)
-lh-e2e                                  # 29 e2e scenarios (real daemon + CLI)
-lh-e2e --suite smoke                    # fast subset (12)
-cargo test -p gui --test kittest        # 13 headless GUI tests
+cargo test --workspace
+lh-e2e
+lh-e2e --suite smoke
+cargo test -p gui --test kittest
 ```
 
 Green on Windows and Linux.
