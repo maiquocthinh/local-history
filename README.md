@@ -1,117 +1,127 @@
 # local-history
 
-Lịch sử thay đổi file **tự động, độc lập với Git** — kiểu JetBrains Local History.
-Bật daemon là xong: mọi file trong project sửa bởi bất kỳ ai (editor, script, tool)
-đều được ghi thành version — kể cả khi editor đã đóng. Undo được cả thay đổi 5 ngày
-trước. Không phải VCS, không thay Git.
+Automatic, **Git-independent file history** — JetBrains Local History style.
+Run the daemon once: every file change in your project is recorded as a
+version, whoever makes it (editor, script, tool) — even while the editor is
+closed. Undo a change from 5 days ago. Not a VCS, never replaces Git.
 
-## Dùng
+## Usage
 
-```bat
+```bash
 cargo build --release
 
-:: bật watcher cho project (chạy nền, icon trong system tray)
+:: start the watcher for a project (background + system tray icon)
 target\release\lh daemon --tray --dir D:\path\to\project
 
-:: mở GUI (bare lh = spawn GUI detached)
+:: open the GUI (bare lh spawns it detached)
 target\release\lh
 
-:: hoặc xem timeline của 1 file
+:: or open one file's timeline
 target\release\lh ui D:\path\to\project\src\main.rs
 ```
 
-Xong. Cứ làm việc bình thường — GUI hiện timeline, click chọn version để xem
-diff side-by-side, nút **Revert to this version** khôi phục 1 click.
+That's it. Work as usual — the GUI shows the timeline; click a version to see
+a side-by-side diff, or hit **Revert to this version** to restore in one click.
 
-## CLI (15 lệnh, đều có `--json`)
+## CLI (15 commands, all with `--json`)
 
-| Lệnh | Việc |
+| Command | What it does |
 |---|---|
-| `lh status` | trạng thái daemon + workspaces |
-| `lh history <file>` | timeline 1 file |
-| `lh show <file> --at 2\|latest` | in nội dung 1 version |
-| `lh diff <file> 1 2\|current` | unified diff 2 version |
-| `lh revert <file> --at 1 --yes` | khôi phục 1 file về version cũ |
-| `lh label <file> "before refactor"` | gắn nhãn ngữ nghĩa |
-| `lh batches` / `lh batch <id>` / `lh revert-batch <id> --yes` | xem / revert **cả đợt** thay đổi |
-| `lh gc [--dry-run]` | dọn history cũ |
-| `lh workspaces` | danh sách workspace trong store |
-| `lh ui <file>` / `lh gui` | mở GUI (detached / foreground) |
-| `lh daemon --tray --dir <path>` | bật watcher (`--dir` lặp được) |
-| `lh self-update [--check\|--force\|--restart]` | tự cập nhật |
+| `lh status` | daemon status + workspaces |
+| `lh history <file>` | one file's timeline |
+| `lh show <file> --at 2\|latest` | print a version's content |
+| `lh diff <file> 1 2\|current` | unified diff between two versions |
+| `lh revert <file> --at 1 --yes` | restore a file to an old version |
+| `lh label <file> "before refactor"` | attach a semantic label |
+| `lh batches` / `lh batch <id>` / `lh revert-batch <id> --yes` | inspect / revert a whole **batch** |
+| `lh gc [--dry-run]` | prune old history |
+| `lh workspaces` | workspaces registered in the store |
+| `lh ui <file>` / `lh gui` | open the GUI (detached / foreground) |
+| `lh daemon --tray --dir <path>` | start the watcher (`--dir` is repeatable) |
+| `lh self-update [--check\|--force\|--restart]` | update in place |
 
-Chú ý nhanh: `lh daemon` không `--dir` → watch thư mục hiện tại; chạy console thay tray
-thì bỏ `--tray` (Ctrl+C để dừng). Menu tray: Open GUI · Pause/Resume · Clean up history ·
-Cập nhật & restart daemon · Quit.
+Quick notes: `lh daemon` without `--dir` watches the current directory; run in
+the console instead of the tray by dropping `--tray` (Ctrl+C to stop). Tray
+menu: Open GUI · Pause/Resume · Clean up history · Update & restart daemon · Quit.
 
-## Nó làm được gì
+## What it does
 
-- **Bắt mọi thay đổi** — daemon nghe native fs events, debounce ~400ms, dedup theo
-  content hash (blake3): save không đổi gì không sinh version rác. Bỏ qua
-  `.git`, `target`, `node_modules`, `dist`, `build`…
-- **Delta nén zstd** — file 100KB sửa 3 dòng ≈ 1–2KB mỗi version; binary file chỉ lưu
-  full; cap 10MB/file.
-- **Rename giữ nguyên history** — file đổi tên thì cả chain version theo sang tên mới
-  (1 version `rename` đánh dấu, label = tên cũ). Rename đè lên file đã track → 2 chain
-  tách rời, không mất gì.
-- **Batch** — các file sửa gần nhau trong thời gian gom thành 1 đợt, xem cả đợt như PR
-  page, revert cả đợt 1 lệnh (file sửa sau batch được giữ nguyên, không bị ghi đè).
-- **GC kiểu JetBrains** — giữ 5 ngày làm việc (Mon–Fri) + tối thiểu 50 version mới nhất
-  mỗi file; daemon dọn lúc start + mỗi 6 giờ; dọn cả blob mồ côi.
-- **Revert an toàn** — luôn ghi version `pre_revert` TRƯỚC khi ghi đè → không bao giờ
-  mất dữ liệu. No-op revert (đĩa đã đúng nội dung) không sinh version.
-- **Self-update nội bộ** — tải manifest đa artifact + sha256 bắt buộc, swap rename
-  metadata-only, lỗi → rollback; crash giữa chừng → lần chạy sau tự khôi phục. Nguồn:
-  flag `--source` > env `LH_UPDATE_SOURCE` > `update.json` cạnh exe.
-  Publish bản mới: `powershell -File scripts\publish-update.ps1 -Source D:\dist\lh`.
-- **i18n vi/en** — CLI `--lang en|vi`; GUI đổi trong app. Lưu không đè project của bạn.
+- **Catches every change** — the daemon listens to native fs events, debounces
+  ~400ms, dedups by content hash (blake3): a save with no content change never
+  creates a junk version. Ignores `.git`, `target`, `node_modules`,
+  `dist`, `build`…
+- **zstd-compressed deltas** — a 100KB file with 3 changed lines ≈ 1–2KB per
+  version; binary files store full snapshots only; 10MB per-file cap.
+- **Rename keeps the history** — renaming a file moves its whole version chain
+  to the new path (one `rename` version marks the move, labeled with the old
+  name). Renaming onto a tracked file keeps the two chains separate — nothing
+  is lost.
+- **Batches** — files changed close in time are grouped into one batch: view
+  it like a PR page, revert the whole batch with one command (files edited
+  after the batch are kept, never clobbered).
+- **JetBrains-style GC** — keeps 5 working days (Mon–Fri) + at least the newest
+  50 versions per file; the daemon prunes at start and every 6 hours; orphan
+  blobs are collected too.
+- **Safe revert** — always records a `pre_revert` snapshot BEFORE overwriting,
+  so it can never lose data. A no-op revert (disk already matches) records
+  nothing.
+- **In-place self-update** — fetches a multi-artifact manifest with mandatory
+  sha256 verification, swaps via metadata-only renames, rolls back on error;
+  a crash mid-update self-heals on the next start. Source: `--source` flag >
+  `LH_UPDATE_SOURCE` env > `update.json` next to the exe. To publish a release:
+  `powershell -File scripts\publish-update.ps1 -Source D:\dist\lh`.
+- **i18n (en/vi)** — CLI `--lang en|vi`; the GUI switches language in-app.
+  Nothing is stored inside your project.
 
 ## GUI
 
-Chọn workspace (combo trái) → file list → timeline (nhóm theo ngày, badge kind/label,
-filter theo kind + label) → diff side-by-side scroll đồng bộ, soft-wrap, thu gọn đoạn
-không đổi, so với version bất kỳ hoặc disk hiện tại. Tab **Activity**: batch view kiểu
-PR + revert cả đợt. Right-click trong diff: copy selection / pane / patch.
+Pick a workspace (left combo) → file list → timeline (grouped by day, kind and
+label badges, filter by kind + label) → side-by-side diff with synced scrolling,
+soft-wrap, unchanged-region collapsing, compare against any version or the
+current disk content. The **Activity** tab: PR-style batch view + whole-batch
+revert. Right-click inside the diff: copy selection / pane / patch.
 
-## Storage & thiết kế
+## Storage & design
 
-Store mặc định `%LOCALAPPDATA%\local-history` (env `LOCAL_HISTORY_DIR`, hoặc
+Default store root `%LOCALAPPDATA%\local-history` (env `LOCAL_HISTORY_DIR`, or
 `lh --store <PATH>`):
 
 ```
 <root>/index.db                        # SQLite (WAL)
-<root>/workspaces/<ws_id>/blobs/*.zst  # full/delta nén zstd, ghi một lần
+<root>/workspaces/<ws_id>/blobs/*.zst  # full/delta snapshots, zstd, write-once
 ```
 
-Một bản cài = **một exe duy nhất** (mô hình `gh`/`uv`) — CLI, daemon, GUI nhúng chung.
-Workspace id = `blake3(canonical project root)`; 1 daemon duy nhất mỗi store (lock).
-Chi tiết: [`docs/architecture.md`](docs/architecture.md) · [`docs/goals.md`](docs/goals.md).
+One install = **one binary** (`gh`/`uv` model) — CLI, daemon and GUI share the
+same exe. Workspace id = `blake3(canonical project root)`; one daemon per store
+(lock file). Details: [`docs/architecture.md`](docs/architecture.md) ·
+[`docs/goals.md`](docs/goals.md).
 
-## Kiểm thử
+## Testing
 
-```bat
-cargo test --workspace                          :: unit + integration (~200 tests)
-lh-e2e --lh target\release\lh                   :: 29 scenario e2e (daemon + CLI thật)
-lh-e2e --suite smoke                            :: nhanh: 12 scenario gốc
-lh-e2e --suite smoke --json                     :: summary JSON cho CI
-cargo test -p gui --test kittest                :: 13 test GUI headless
-env LH_E2E_KEEP=1 lh-e2e ...                    :: giữ tempdir khi fail để debug
+```bash
+cargo test --workspace                          # unit + integration (~200 tests)
+lh-e2e --lh target\release\lh                   # 29 e2e scenarios (real daemon + CLI)
+lh-e2e --suite smoke                            # fast: the original 12
+lh-e2e --suite smoke --json                     # JSON summary for CI
+cargo test -p gui --test kittest                # 13 headless GUI tests
+env LH_E2E_KEEP=1 lh-e2e ...                    # keep temp dirs on failure for debugging
 ```
 
-e2e phủ: rename giữ chain + collision, debounce coalesce, kill -9 giữa burst +
-respawn, blob hỏng → lỗi sạch, delta rollover (21 edit byte-exact từng seq),
-concurrent writers, stale lock takeover, orphan blob GC, cap 10MB, file
-rỗng/NUL/CRLF/unicode, đủ 15 lệnh CLI, self-update (swap/rollback/noop/missing
-artifact). Chạy xanh trên **Windows và Linux**.
+e2e covers: rename keeps the chain + collision fallback, debounce coalescing,
+kill -9 mid-burst + respawn, corrupted blob → clean error, delta rollover
+(21 edits, byte-exact at every seq), concurrent writers, stale lock takeover,
+orphan blob GC, the 10MB cap, empty/NUL/CRLF/unicode files, all 15 CLI
+commands, self-update (swap/rollback/noop/missing artifact). Green on both
+**Windows and Linux**.
 
 ## Non-goals
 
-- Không thay Git — không branch/merge/remote/commit.
-- Không track ngoài workspace đã đăng ký; không lịch sử file > 10MB.
-- Không mã hóa, không sync lịch sử giữa các máy.
+- Not a Git replacement — no branch/merge/remote/commit.
+- Nothing tracked outside registered workspaces; no history for files > 10MB.
+- No encryption, no cross-machine history sync.
 
 ## Build
 
-Rust stable MSVC + VS Build Tools (rusqlite bundled + zstd cần C compiler).
-Chạy trên Windows và Linux; GUI dùng renderer Glow (OpenGL) — ổn hơn wgpu trên
-máy ảo / GPU hạn chế.
+Rust stable MSVC + VS Build Tools (rusqlite bundled and zstd need a C
+compiler). Runs on Windows and Linux; the GUI uses the Glow (OpenGL) renderer —
+more stable than wgpu on VMs / limited GPUs.
